@@ -1,0 +1,7 @@
+[browser]
+# keep everything local: no usage statistics sent to Streamlit
+gatherUsageStats = false
+
+[server]
+headless = true
+address = "localhost"

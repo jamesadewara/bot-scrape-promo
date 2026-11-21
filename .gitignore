@@ -221,3 +221,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# PromoScout runtime data (SQLite, status.json, request log) and exports
+/data/
+approved.csv
