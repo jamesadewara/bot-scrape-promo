@@ -121,7 +121,8 @@ powercfg /change standby-timeout-ac 0
 ## Docker (local)
 
 ```powershell
-docker compose up -d --build
+docker build -t promoscout:latest .
+docker compose up -d
 docker compose logs -f bot
 docker compose exec bot python -m promoscout check
 docker compose down
@@ -171,15 +172,18 @@ exit
 git clone https://github.com/jamesadewara/bot-scrape-promo.git
 cd bot-scrape-promo
 cp .env.example .env
-docker compose up -d --build
+nano .env
+sudo docker build -t promoscout:latest .
+sudo docker compose up -d
 ```
 
 ## Server with 1 GB RAM (bot always on, review only when needed)
 
 ```bash
-docker compose up -d --build bot
-docker compose up -d review
-docker compose stop review
+sudo docker build -t promoscout:latest .
+sudo docker compose up -d bot
+sudo docker compose up -d review
+sudo docker compose stop review
 ```
 
 ## Server status
@@ -246,7 +250,8 @@ bash deploy.sh
 # rollback to the previous version
 git log --oneline -5
 git checkout <commit>
-docker compose up -d --build
+sudo docker build -t promoscout:latest .
+sudo docker compose up -d
 git checkout main
 ```
 

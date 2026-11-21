@@ -1,7 +1,8 @@
 services:
   bot:
-    build: .
+    # built by: docker build -t promoscout:latest .   (deploy.sh does this; no buildx needed)
     image: promoscout:latest
+    pull_policy: never
     command: ["python", "-m", "promoscout", "auto", "--quiet"]
     env_file:
       - path: .env
@@ -12,8 +13,8 @@ services:
     stop_grace_period: 30s   # time to save the checkpoint on `docker compose stop`
 
   review:
-    build: .
     image: promoscout:latest
+    pull_policy: never
     depends_on:
       - bot
     command: ["streamlit", "run", "review_app.py", "--server.address=0.0.0.0", "--server.port=8501"]
