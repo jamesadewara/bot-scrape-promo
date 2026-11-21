@@ -14,6 +14,7 @@ import structlog
 
 from .crawler import Crawler
 from .fetcher import Fetcher
+from .notify import build_report, configured, notify_problem, notify_recovered, notify_run, send
 from .scoring import review_sort_key
 from .settings import Settings
 from .store import Store
@@ -42,9 +43,32 @@ async def _one_run(args: argparse.Namespace, settings: Settings, resume: bool):
     try:
         async with Fetcher(settings) as fetcher:
             crawler = Crawler(settings, store, fetcher, live=not args.quiet)
-            return await crawler.run(seed=args.seed, use_sitemaps=not args.no_sitemaps, resume=resume)
+            summary = await crawler.run(seed=args.seed, use_sitemaps=not args.no_sitemaps, resume=resume)
     finally:
         store.close()
+    # one email per batch with new hot finds (off unless configured); runs off the event loop
+    await asyncio.to_thread(notify_run, settings, summary.run_id)
+    await asyncio.to_thread(_problem_emails, settings, summary)
+    return summary
+
+
+def _problem_emails(settings: Settings, summary) -> None:
+    """Email every recipient when a batch hits a problem; and once more when it works again."""
+    if summary.state == "stopped (block)":
+        store = Store(settings.db_path)
+        try:
+            until = store.lock_until()
+        finally:
+            store.close()
+        notify_problem(settings, "block", "Jumia block signal: bot stopped and locked",
+                       f"Reason: {summary.reason}\nLocked until: {time.ctime(until)}\n"
+                       "Nothing is fetched while locked. Auto mode has stopped; restart it after the lock "
+                       "ends (python -m promoscout auto, or docker compose restart bot).", force=True)
+    elif summary.state == "stopped (errors)":
+        notify_problem(settings, "errors", "Batch stopped: too many errors",
+                       f"Reason: {summary.reason}\nPages: {summary.pages}. Auto mode keeps retrying.")
+    elif summary.state in ("done",) and summary.pages > 0:
+        notify_recovered(settings, f"Last batch: {summary.pages} pages, {summary.new_qualifying} new 80%+ finds.")
 
 
 async def _run(args: argparse.Namespace, settings: Settings) -> int:
@@ -55,7 +79,8 @@ async def _run(args: argparse.Namespace, settings: Settings) -> int:
     return 0 if summary.state in ("done",) else (2 if summary.state == "refused" else 1)
 
 
-PRESSURE_OUTCOMES = ("pushback", "server_error", "network_error", "truncated")
+PUSHBACK_OUTCOMES = ("pushback", "server_error")
+FAILED_STATES = ("stopped (error)", "stopped (network)", "stopped (errors)")
 
 
 def _midnight_after(now: float) -> float:
@@ -63,13 +88,22 @@ def _midnight_after(now: float) -> float:
     return time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday + 1, 0, 0, 5, 0, 0, -1))
 
 
-def next_batch_at(settings: Settings, now: float | None = None) -> tuple[float, str]:
-    """When auto mode should start the next batch, and why.
+def _next_hour_mark(t: float, minute: int) -> float:
+    """First HH:<minute>:00 at or after t."""
+    lt = time.localtime(t)
+    mark = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, lt.tm_hour, minute, 0, 0, 0, -1))
+    return mark if mark >= t else mark + 3600
 
-    Rest time follows the work just done: rest = last batch duration x auto_rest_factor,
-    kept between auto_min_cooldown_minutes and auto_max_cooldown_minutes. If the server pushed
-    back or the network failed in the last batch, rest the maximum. The request rate itself is
-    what keeps traffic polite; the rest keeps long-run load low.
+
+def rest_after(settings: Settings, failures: int = 0, now: float | None = None) -> tuple[float, str]:
+    """How long auto mode rests after the last batch, and why.
+
+    The rest pays back the load of the work actually done:
+      - real work: rest = batch duration x auto_rest_factor, between min and max cooldown
+      - the server pushed back (429/503/5xx) in that batch: rest the max cooldown
+      - the batch did no work because it failed (network, robots.txt unreachable): retry soon,
+        auto_retry_minutes, doubling on each failure in a row (up to the max cooldown)
+      - the batch found nothing to fetch: rest the min cooldown
     """
     now = now or time.time()
     store = Store(settings.db_path)
@@ -78,33 +112,38 @@ def next_batch_at(settings: Settings, now: float | None = None) -> tuple[float, 
         if lock > now:
             return lock, "locked after a block signal"
         lo, hi = settings.auto_min_cooldown_minutes * 60, settings.auto_max_cooldown_minutes * 60
-        last = store.db.execute("SELECT id, started_at, ended_at, pages_fetched FROM runs "
+        last = store.db.execute("SELECT id, started_at, ended_at, state, pages_fetched FROM runs "
                                 "WHERE ended_at IS NOT NULL ORDER BY id DESC LIMIT 1").fetchone()
         if last is None:
             return now, "first batch"
         worked = max(0.0, last["ended_at"] - last["started_at"])
-        rest = min(hi, max(lo, worked * settings.auto_rest_factor))
-        reason = f"rest {rest / 60:.0f} min after a {worked / 60:.0f} min batch"
-        pressure = store.db.execute(
-            f"SELECT COUNT(*) FROM requests WHERE run_id=? AND (attempt > 1 OR outcome IN "
-            f"({','.join('?' * len(PRESSURE_OUTCOMES))}))", (last["id"], *PRESSURE_OUTCOMES)).fetchone()[0]
-        if pressure:
-            rest = hi
-            reason = f"rest {rest / 60:.0f} min: server pushback / network trouble in the last batch"
+        pushback = store.db.execute(
+            "SELECT COUNT(*) FROM requests WHERE run_id=? AND outcome IN (?, ?)",
+            (last["id"], *PUSHBACK_OUTCOMES)).fetchone()[0]
+        if pushback:
+            rest, reason = hi, f"rest {hi / 60:.0f} min: server pushed back {pushback}x in the last batch"
+        elif not last["pages_fetched"] and last["state"] in FAILED_STATES:
+            rest = min(hi, settings.auto_retry_minutes * 60 * (2 ** max(0, failures - 1)))
+            reason = f"retry in {rest / 60:.0f} min: last batch failed ({last['state']})"
+        elif not last["pages_fetched"]:
+            rest, reason = lo, f"rest {lo / 60:.0f} min: nothing was due"
+        else:
+            rest = min(hi, max(lo, worked * settings.auto_rest_factor))
+            reason = f"rest {rest / 60:.0f} min after a {worked / 60:.0f} min batch ({last['pages_fetched']} pages)"
         start = last["ended_at"] + rest
-        if not store.get_kv("checkpoint") and not last["pages_fetched"]:
-            # nothing left over and nothing was due: wait until pages are due again (max cooldown)
-            due = store.db.execute("SELECT MIN(next_check_at) FROM pages WHERE next_check_at > ?",
-                                   (now,)).fetchone()[0]
-            if due:
-                start = max(start, min(due, now + hi))
-                reason = "nothing due yet; waiting for checked pages to become due"
+        if settings.auto_align_to_hour:
+            aligned = _next_hour_mark(max(start, now), settings.auto_align_minute)
+            start, reason = aligned, reason + f"; aligned to :{settings.auto_align_minute:02d} past the hour"
         if store.runs_today() >= settings.auto_max_runs_per_day:
             start = max(start, _midnight_after(now))
             reason = f"auto_max_runs_per_day ({settings.auto_max_runs_per_day}) reached"
         return max(start, now), reason
     finally:
         store.close()
+
+
+def next_batch_at(settings: Settings, now: float | None = None, failures: int = 0) -> tuple[float, str]:
+    return rest_after(settings, failures, now)
 
 
 def _write_cooldown_status(settings: Settings, until: float, reason: str, batch: int) -> None:
@@ -120,34 +159,55 @@ def _write_cooldown_status(settings: Settings, until: float, reason: str, batch:
 
 
 async def _auto(args: argparse.Namespace, settings: Settings) -> int:
-    """Run batch after batch, cooling down in between. Stops for good on a block signal."""
+    try:
+        return await _auto_loop(args, settings)
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        raise
+    except Exception as exc:  # unexpected crash: tell the recipients, then fail loudly
+        import traceback
+        await asyncio.to_thread(
+            notify_problem, settings, "crash", f"Auto mode crashed: {type(exc).__name__}",
+            traceback.format_exc()[-3000:], True)
+        raise
+
+
+async def _auto_loop(args: argparse.Namespace, settings: Settings) -> int:
+    """Batch, rest, batch... The first batch starts at once (only a lock or the daily cap delays it).
+    Stops for good on a block signal."""
     batch = 0
+    failures = 0
     resume = args.resume
-    # auto mode has its own daily batch cap; batches are spaced by the rest rule above
     run_settings = settings.model_copy(update={"max_runs_per_day": settings.auto_max_runs_per_day})
     while True:
-        start, why = next_batch_at(settings)
+        start, why = next_batch_at(settings, failures=failures)
         if why.startswith("locked"):
             print(f"[auto] bot is locked until {time.ctime(start)} after a block signal; not starting.")
+            await asyncio.to_thread(
+                notify_problem, settings, "locked", "Auto mode cannot start: bot is locked",
+                f"Locked until {time.ctime(start)} after a Jumia block signal.")
             return 1
-        if batch == 0 and why.startswith("rest"):
-            start = time.time()  # starting auto mode: first batch now
+        if batch == 0 and not why.startswith("auto_max_runs_per_day"):
+            start, why = time.time(), "starting"  # you started auto mode: work now
         wait = start - time.time()
         if wait > 0:
             print(f"[auto] next batch at {time.ctime(start)} ({why})")
             _write_cooldown_status(settings, start, why, batch)
             while time.time() < start:
-                await asyncio.sleep(min(60, max(1, start - time.time())))
+                await asyncio.sleep(min(30, max(1, start - time.time())))
         summary = await _one_run(args, run_settings, resume)
-        resume = False
         batch += 1
         print(f"[auto] batch {batch}: run {summary.run_id} {summary.state} - {summary.reason}; "
               f"pages {summary.pages}, new 80%+ {summary.new_qualifying}")
         if summary.state == "stopped (block)":
             print("[auto] block signal: stopping auto mode. Check `python -m promoscout check` before restarting.")
             return 1
-        if summary.state == "stopped (network)":
-            resume = True  # continue the interrupted batch after the cooldown
+        failures = failures + 1 if (summary.pages == 0 and summary.state in FAILED_STATES) else 0
+        if failures == 3:
+            await asyncio.to_thread(
+                notify_problem, settings, "unreachable", "Jumia unreachable: 3 batches failed in a row",
+                f"Last error: {summary.reason}\nThe bot keeps retrying (2, 4, 8 ... up to "
+                f"{settings.auto_max_cooldown_minutes:g} min apart). No action needed if it is a short outage.")
+        resume = summary.state == "stopped (network)"  # continue an interrupted batch
         if settings.auto_max_batches and batch >= settings.auto_max_batches:
             print(f"[auto] {batch} batches done")
             return 0
@@ -190,7 +250,8 @@ def cmd_check(args: argparse.Namespace, settings: Settings) -> int:
         print(f"LOCKED until {time.ctime(lock)}: {store.get_kv('lock_reason')}")
     else:
         print("not locked")
-    print(f"runs today: {store.runs_today()} / {settings.max_runs_per_day}")
+    print(f"runs today: {store.runs_today()} (manual run cap {settings.max_runs_per_day}, "
+          f"auto cap {settings.auto_max_runs_per_day})")
 
     print("\n== Runs (latest 10)")
     for r in db.execute("SELECT id, started_at, ended_at, state, reason, pages_fetched, requests, bytes, "
@@ -236,6 +297,10 @@ def cmd_check(args: argparse.Namespace, settings: Settings) -> int:
     ok &= low is None or low >= 79.5
     for st_, n in db.execute("SELECT review_status, COUNT(*) FROM products WHERE qualifies=1 GROUP BY 1"):
         print(f"  {st_}: {n}")
+    hot = [r for r in shown if (r["discount_pct"] or 0) >= settings.alert_min_discount]
+    print(f"hot finds ({settings.alert_min_discount:g}%+): {len(hot)}")
+    for r in sorted(hot, key=review_sort_key)[:10]:
+        print(f"  HOT {r['discount_pct']:.1f}%  {r['review_status']:<8} {(r['title'] or r['sku'])[:50]}  {r['url']}")
     top = [r["review_status"] for r in sorted(store.qualifying(settings.max_price_ngn, settings.max_old_price_ngn), key=review_sort_key)[:20]]
     reviewed = [s for s in top if s in ("approved", "rejected")]
     if reviewed:
@@ -259,6 +324,27 @@ def cmd_check(args: argparse.Namespace, settings: Settings) -> int:
     print("\nOVERALL:", "OK" if ok else "PROBLEM - see above")
     store.close()
     return 0 if ok else 1
+
+
+def cmd_test_email(args: argparse.Namespace, settings: Settings) -> int:
+    if not (settings.smtp_user and settings.smtp_password):
+        print("Set PROMOSCOUT_SMTP_USER and PROMOSCOUT_SMTP_PASSWORD (Gmail app password) in .env")
+        return 1
+    if not configured(settings):
+        print("Note: PROMOSCOUT_EMAIL_ENABLED is not true; batches will not email until it is.")
+    store = Store(settings.db_path)
+    try:
+        last = store.db.execute("SELECT MAX(id) FROM runs").fetchone()[0]
+        msg = build_report(settings, last, store, test=True)
+    finally:
+        store.close()
+    try:
+        send(settings, msg)
+    except Exception as exc:  # noqa: BLE001
+        print(f"Email failed: {type(exc).__name__}: {exc}")
+        return 1
+    print(f"Test email sent to {msg['To']}")
+    return 0
 
 
 def cmd_status(args: argparse.Namespace, settings: Settings) -> int:
@@ -289,6 +375,7 @@ def main(argv: list[str] | None = None) -> int:
     a.add_argument("--resume", action="store_true", help="start by resuming the last checkpoint")
     a.add_argument("--quiet", action="store_true", help="no live terminal panel")
     sub.add_parser("status", help="print the last status.json")
+    sub.add_parser("test-email", help="send a test email with the current best finds")
     sub.add_parser("check", help="is it working? runs, compliance audit, results, yield per page type")
     args = ap.parse_args(argv)
     # `docker stop` / systemd send SIGTERM: treat it like Ctrl+C so the checkpoint is saved
@@ -313,6 +400,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_export(args, settings)
     if args.cmd == "check":
         return cmd_check(args, settings)
+    if args.cmd == "test-email":
+        return cmd_test_email(args, settings)
     return cmd_status(args, settings)
 
 

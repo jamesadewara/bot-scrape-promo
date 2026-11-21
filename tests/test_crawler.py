@@ -1,5 +1,6 @@
 """Crawl loop end-to-end with a fake fetcher (no network): rule, memory, kill switches, retries."""
 import json
+import time
 
 import pytest
 
@@ -78,7 +79,8 @@ def env(tmp_path, fixture_text):
     robots = (200, fixture_text("robots.txt"), {})
 
     def make(routes, default=(404, "", {}), **overrides):
-        kw = dict(data_dir=tmp_path, max_runs_per_day=99, retry_backoff_s=0.01, network_pause_s=0.01)
+        kw = dict(data_dir=tmp_path, max_runs_per_day=99, retry_backoff_s=0.01, network_pause_s=0.01,
+                  promo_seed_paths=[])
         kw.update(overrides)
         s = Settings(**kw)
         store = Store(s.db_path)
@@ -124,7 +126,8 @@ async def test_disallowed_links_never_requested(env, fixture_text):
     for bad in ("sort=", "q=", "/fragment/", "/cart/", "/customer/", "utm_"):
         assert not any(bad in u for u in f.calls), bad
     assert B + "/tablets/?page=2" in f.calls
-    assert c.status.skipped_robots > 0
+    # robots-blocked links never got a request (filter links are dropped even earlier)
+    assert all(c.robots.allowed(u) for u in f.calls)
 
 
 async def test_block_403_kills_and_locks(env, fixture_text):
@@ -392,3 +395,193 @@ async def test_price_filter_applied(env, fixture_text):
     assert B + "/small-deal-400000101.html" not in f.calls              # no verify request spent on it
     assert store.get_product("DEEP000001")["qualifies"] == 1
     assert {r["sku"] for r in store.qualifying(20_000, 1_000_000)} >= {"DEEP000001"}
+
+
+async def test_failed_run_keeps_saved_queue(env, fixture_text):
+    routes = {B + "/tablets/": html(fixture_text, "listing_tablets.html")}
+    c, f, store, _ = env(routes, max_links_per_run=1)
+    await c.run(seed=B + "/tablets/", use_sitemaps=False)
+    saved = store.get_kv("checkpoint")
+    assert saved and json.loads(saved)["entries"]
+    # next run cannot even read robots.txt (network down): the queue must survive
+    c2, f2, store2, _ = env({ROBOTS_URL: "network"})
+    s2 = await c2.run(use_sitemaps=False)
+    assert s2.state == "stopped (error)"
+    assert store2.get_kv("checkpoint") == saved
+
+
+async def test_stale_running_run_is_closed(env, fixture_text):
+    c, f, store, _ = env({B + "/tablets/": html(fixture_text, "listing_edge_cases.html")}, default=(500, "", {}))
+    rid = store.start_run()                                      # simulates a run killed mid-way
+    store.log_request(rid, B + "/x/", "listing", 200, "ok", "allow", 1, 0.1, 1)
+    await c.run(seed=B + "/tablets/", use_sitemaps=False)
+    row = store.db.execute("SELECT state, ended_at, requests FROM runs WHERE id=?", (rid,)).fetchone()
+    assert row["state"] == "stopped (interrupted)" and row["ended_at"] and row["requests"] == 1
+
+
+async def test_rediscovers_when_queue_empty_and_sitemaps_recent(env, fixture_text):
+    index = ('<?xml version="1.0"?><sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+             '<sitemap><loc>https://static.jumia.com.ng/categories-sitemap.xml.gz</loc></sitemap></sitemapindex>')
+    cats = ('<?xml version="1.0"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+            f'<url><loc>{B}/tablets/</loc></url><url><loc>{B}/phones/</loc></url></urlset>')
+    routes = {
+        "https://static.jumia.com.ng/index-sitemap.xml": (200, index, {}),
+        "https://static.jumia.com.ng/categories-sitemap.xml.gz": (200, cats, {}),
+        B + "/tablets/": html(fixture_text, "listing_edge_cases.html"),
+        B + "/phones/": html(fixture_text, "listing_edge_cases.html"),
+    }
+    c, f, store, _ = env(routes, max_links_per_run=3, default=(500, "", {}))
+    await c.run(use_sitemaps=True)                      # reads sitemaps + /tablets/, /phones/ left over
+    store.set_kv("checkpoint", "")                      # queue lost (old bug) or fully used
+    c2, f2, _, _ = env(routes, default=(500, "", {}))
+    s2 = await c2.run(use_sitemaps=True)
+    assert "https://static.jumia.com.ng/index-sitemap.xml" in f2.calls   # read again although recent
+    assert B + "/phones/" in f2.calls or B + "/tablets/" in f2.calls     # and real pages got fetched
+    assert s2.pages > 0
+
+
+async def test_pagination_continues_without_using_depth(env, fixture_text):
+    page = html(fixture_text, "listing_tablets.html")   # links to ?page=2 and ?page=3
+    c, f, store, _ = env({B + "/tablets/": page, B + "/tablets/?page=2": page, B + "/tablets/?page=3": page},
+                         max_depth=0, default=(500, "", {}))
+    await c.run(seed=B + "/tablets/", use_sitemaps=False)
+    assert B + "/tablets/?page=2" in f.calls and B + "/tablets/?page=3" in f.calls
+    assert B + "/smartphones/" not in f.calls            # max_depth=0: no new hops, only paging
+
+
+async def test_link_mix_not_crowded_by_one_kind(env, fixture_text):
+    menu = "".join(f'<a href="/mlp-promo-{i}/">p{i}</a>' for i in range(20))
+    cats = "".join(f'<a href="/category-{i}/">c{i}</a>' for i in range(5))
+    listing = fixture_text("listing_tablets.html").replace("</main>", menu + cats + "</main>")
+    c, f, store, _ = env({B + "/tablets/": (200, listing, {})}, max_links_per_run=1)
+    await c.run(seed=B + "/tablets/", use_sitemaps=False)
+    queued = [e["url"] for e in json.loads(store.get_kv("checkpoint"))["entries"]]
+    n_mlp = sum("/mlp-promo-" in u for u in queued)
+    n_listing = sum(("/category-" in u) or u.endswith("/smartphones/") or "/tablets/?page" in u for u in queued)
+    assert n_listing >= 3 and n_mlp >= 3                  # both kinds get slots
+    assert B + "/smartphones/" in queued                  # gadget/phone link wins a listing slot
+    assert len(queued) <= 10                              # max_outlinks_per_page
+
+
+async def test_promo_seeds_checked_and_missing_ones_cheap(env, fixture_text):
+    c, f, store, _ = env({B + "/mlp-clearance/": html(fixture_text, "listing_edge_cases.html")},
+                         promo_seed_paths=["/mlp-clearance/", "/mlp-treasure-hunt/", "/cart/"],
+                         default=(404, "", {}))
+    await c.run(use_sitemaps=False)
+    assert B + "/mlp-clearance/" in f.calls and B + "/mlp-treasure-hunt/" in f.calls
+    assert B + "/cart/" not in f.calls                                    # robots still decides
+    assert c.status.new_qualifying >= 6                                   # finds from the promo page
+    gone = store.get_page(B + "/mlp-treasure-hunt/")
+    assert gone["last_outcome"] == "gone" and gone["next_check_at"] > time.time() + 20 * 3600
+
+
+def test_deep_promo_words_rank_higher():
+    from promoscout.frontier import link_priority
+    assert link_priority(B + "/mlp-treasure-hunt/", None, False) > link_priority(B + "/mlp-phones/", None, False)
+    assert link_priority(B + "/mlp-clearance-sale/", None, False) > link_priority(B + "/mlp-phones/", None, False)
+
+
+async def test_hot_find_alerted_once(env, fixture_text):
+    routes = {B + "/tablets/": html(fixture_text, "listing_edge_cases.html")}
+    c, f, store, _ = env(routes, default=(500, "", {}))
+    await c.run(seed=B + "/tablets/", use_sitemaps=False)
+    hot = {h["sku"] for h in c.status.hot_finds}
+    assert hot == {"FREE000001"}                         # 100% off; 90% cards are below the 95% line
+    lines = c.s.alerts_path.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 1 and json.loads(lines[0])["discount_pct"] == 100
+    assert store.get_product("FREE000001")["alerted_at"]
+    assert "HOT:" in c.status.panel().renderable.plain
+    store.db.execute("UPDATE pages SET next_check_at=0, content_hash=NULL")
+    c2, _, _, _ = env(routes, default=(500, "", {}))
+    await c2.run(seed=B + "/tablets/", use_sitemaps=False)
+    assert c2.status.hot_finds == []                      # same product: no second alert
+    assert len(c.s.alerts_path.read_text(encoding="utf-8").strip().splitlines()) == 1
+
+
+async def test_hot_threshold_setting(env, fixture_text):
+    c, f, store, _ = env({B + "/tablets/": html(fixture_text, "listing_edge_cases.html")},
+                         default=(500, "", {}), alert_min_discount=90)
+    await c.run(seed=B + "/tablets/", use_sitemaps=False)
+    assert {"FREE000001", "DEEP000001", "BADGE00001"} <= {h["sku"] for h in c.status.hot_finds}
+
+
+async def test_gadget_pages_queued_before_others(env, fixture_text):
+    links = '<a href="/groceries/">g</a><a href="/home-office/">h</a><a href="/smartphones/">s</a><a href="/laptops/">l</a>'
+    listing = fixture_text("listing_tablets.html").replace("</main>", links + "</main>")
+    c, f, store, _ = env({B + "/tablets/": (200, listing, {})}, max_links_per_run=1)
+    await c.run(seed=B + "/tablets/", use_sitemaps=False)
+    pr = {e["url"]: e["priority"] for e in json.loads(store.get_kv("checkpoint"))["entries"]}
+    assert pr[B + "/smartphones/"] > pr[B + "/groceries/"] and pr[B + "/laptops/"] > pr[B + "/home-office/"]
+
+
+async def test_hidden_unchanged_find_not_reverified(env, fixture_text):
+    routes = {B + "/tablets/": html(fixture_text, "listing_edge_cases.html")}
+    c, f, store, _ = env(routes, default=(500, "", {}))
+    await c.run(seed=B + "/tablets/", use_sitemaps=False)
+    store.set_review("DEEP000001", "hidden")
+    store.db.execute("UPDATE pages SET next_check_at=0, content_hash=NULL")
+    store.db.execute("UPDATE products SET product_page_checked_at=NULL")
+    c2, f2, _, _ = env(routes, default=(500, "", {}))
+    await c2.run(seed=B + "/tablets/", use_sitemaps=False)
+    assert B + "/deep-deal-400000100.html" not in f2.calls       # memo: hidden + same price -> no request
+    assert B + "/free-item-400000103.html" in f2.calls           # other finds still verified
+
+
+
+async def test_filter_variants_and_lookalike_family_capped(env, fixture_text):
+    menu = "".join(f'<a href="/mlp-samsung-model-{i}/">m{i}</a>' for i in range(12))
+    menu += '<a href="/mlp-samsung-model-0/?official_store=1">o</a><a href="/phones/?damage_grade=B">d</a>'
+    listing = fixture_text("listing_tablets.html").replace("</main>", menu + "</main>")
+    # look-alike pages without any 80%+ item (old price 630,000 -> 130,000 makes the top card ~21%)
+    clone = fixture_text("listing_tablets.html").replace("630,000", "130,000").replace("</main>", menu + "</main>")
+    routes = {B + "/tablets/": (200, listing, {})}
+    for i in range(12):
+        routes[B + f"/mlp-samsung-model-{i}/"] = (200, clone, {})
+    c, f, store, _ = env(routes, default=(500, "", {}), family_cap_per_run=3)
+    await c.run(seed=B + "/tablets/", use_sitemaps=False)
+    assert not any("official_store" in u or "damage_grade" in u for u in f.calls)
+    fam = [u for u in f.calls if "/mlp-samsung-model-" in u]
+    assert 0 < len(fam) <= 3                         # family cap enforced at fetch time
+
+
+def test_page_family_and_filter_params():
+    from promoscout.urls import has_filter_params, page_family
+    assert page_family(B + "/mlp-samsung-galaxy-s4/") == page_family(B + "/mlp-samsung-j2-core/") == "mlp-samsung"
+    assert page_family(B + "/tablets/apple/") == "tablets"
+    assert has_filter_params(B + "/x/?official_store=1") and not has_filter_params(B + "/x/?page=2")
+
+
+
+async def test_learns_family_yield_from_history(env, fixture_text):
+    c, f, store, _ = env({})
+    now = time.time()
+    for i in range(4):   # clearance pages: 3 finds each
+        store.upsert_page(B + f"/mlp-clearance-{i}/", page_type="campaign", best_discount=90, last_fetched=now)
+    for i in range(12):  # phone handset pages: one find in 12 pages
+        store.upsert_page(B + f"/mlp-samsung-m{i}/", page_type="campaign", best_discount=81, last_fetched=now)
+    rid = store.start_run()
+    for i in range(12):
+        store.upsert_product(sku=f"c{i}", qualifies=True, discount_pct=88, url=B + f"/c{i}-1.html", run_id=rid,
+                             title="x", price=1, old_price=10, currency="NGN", flags=[],
+                             source_page=B + f"/mlp-clearance-{i % 4}/")
+    store.upsert_product(sku="s0", qualifies=True, discount_pct=81, url=B + "/s0-1.html", run_id=rid, title="x",
+                         price=1, old_price=10, currency="NGN", flags=[], source_page=B + "/mlp-samsung-m0/")
+    c._load_history()
+    assert c.family_bonus["mlp-clearance"] == 40                 # 3 finds/page x 20, capped at 40
+    assert c.family_bonus["mlp-samsung"] == -25 and "mlp-samsung" in c.family_suppressed
+    assert c._focus(B + "/mlp-samsung-galaxy/") == -25            # focus bonus no longer lifts it
+    assert c._focus(B + "/mlp-clearance-sale/") > c._focus(B + "/mlp-samsung-galaxy/")
+
+
+async def test_category_saved_and_filter_variants_never_fetched(env, fixture_text):
+    page = html(fixture_text, "listing_tablets.html")
+    routes = {B + "/tablets/": page}
+    c, f, store, _ = env(routes, default=(500, "", {}))
+    store.set_kv("checkpoint", json.dumps({"entries": [
+        {"url": B + "/phones-tablets/?official_store=1&page=5", "depth": 1, "priority": 999, "tier": 0,
+         "kind": "listing", "section": "phones-tablets", "parent": None, "reason": "carried"}], "visited": {}}))
+    await c.run(seed=B + "/tablets/", use_sitemaps=False)
+    assert not any("official_store" in u for u in f.calls)          # carried filter link dropped
+    top = store.get_product("TI527MP5Y6603NAFAMZ")
+    assert top["qualifies"] == 1 and top["category"] == "Phones & Tablets > Tablets > Other Tablets" or \
+        top["category"].startswith("Phones & Tablets > Tablets")

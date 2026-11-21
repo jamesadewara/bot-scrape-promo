@@ -72,3 +72,16 @@ def test_page_types():
     assert page_type(B + "/flash-sales/") == "campaign"
     assert page_type(B + "/x-y-419065810.html") == "product"
     assert page_type("https://static.jumia.com.ng/index-sitemap.xml") == "sitemap"
+
+
+def test_page_types_from_real_jumia_links(robots):
+    # seen in the bot's own raw fetch of /tablets/ and /flash-sales/ (2026-11-21)
+    assert page_type(B + "/tablets/apple/") == "listing" and robots.allowed(B + "/tablets/apple/")
+    assert page_type(B + "/phones-tablets/flash-sales/") == "campaign"
+    assert robots.allowed(B + "/phones-tablets/flash-sales/")
+    assert page_type(B + "/tk17-pro-max-tablet-tk-mpg12085122.html") == "product"
+    assert page_type(B + "/sp-help/") == "other"                     # help pages, not promos
+    assert page_type(B + "/blog/") == "other"
+    assert not robots.allowed(B + "/tablets/generic/")              # */generic/ stays disallowed
+    assert not robots.allowed(B + "/mlp-black-friday/xiaomi/")       # /mlp-*/*/ stays disallowed
+    assert not robots.allowed(B + "/flash-sales/fashion-brand/")

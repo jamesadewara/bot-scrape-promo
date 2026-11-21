@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import json
 import os
-import statistics
 import tempfile
 import time
 from collections import deque
@@ -60,17 +59,14 @@ class RunStatus:
     new_qualifying: int = 0
     best_discount: float | None = None
     estimate_note: str | None = None
-    _rate_samples: deque = field(default_factory=lambda: deque(maxlen=10))
-    _last_page_t: float | None = None
+    hot_finds: list = field(default_factory=list)  # newest first, 95%+ alerts this run
+    # finish times of the last 30 pages: the rate is measured over this window (moving average).
+    # Per-page gaps are useless with concurrency: 3 pages finishing together look like 1000 pages/min.
+    _page_times: deque = field(default_factory=lambda: deque(maxlen=30))
 
     # ------------------------------------------------------------------ events
     def page_done(self, kind: str, nbytes: int, new_hits: int) -> None:
-        now = time.time()
-        if self._last_page_t is not None:
-            dt = now - self._last_page_t
-            if dt > 0:
-                self._rate_samples.append(60.0 / dt)  # pages/min, smoothed by moving average
-        self._last_page_t = now
+        self._page_times.append(time.time())
         self.pages_done += 1
         self.pages_by_type[kind] = self.pages_by_type.get(kind, 0) + 1
         self.bytes_by_type[kind] = self.bytes_by_type.get(kind, 0) + nbytes
@@ -88,6 +84,15 @@ class RunStatus:
     def hit_rate_per_100(self) -> float:
         return 100.0 * self.new_qualifying / self.pages_done if self.pages_done else 0.0
 
+    @property
+    def pages_per_minute(self) -> float | None:
+        """Pages per minute over the last (up to) 30 pages, counted from the first of them."""
+        t = self._page_times
+        if len(t) < 3:
+            return None
+        span = time.time() - t[0]
+        return 60.0 * (len(t) - 1) / span if span > 0 else None
+
     def _avg_size(self, kind: str) -> float | None:
         n = self.pages_by_type.get(kind)
         return self.bytes_by_type.get(kind, 0) / n if n else None
@@ -95,7 +100,7 @@ class RunStatus:
     def predictions(self) -> dict:
         remaining_pages = max(0, self.max_links - self.pages_done)
         remaining_time = max(0.0, self.max_runtime_s - self.elapsed)
-        rate = statistics.fmean(self._rate_samples) if self._rate_samples else self.effective_rate or self.set_rpm
+        rate = self.pages_per_minute or self.effective_rate or self.set_rpm
         rate = max(rate, 0.1)
         # only pages that will actually be fetched: cap by what is queued
         will_fetch = min(remaining_pages, self.queue) if self.queue else remaining_pages
@@ -198,4 +203,6 @@ class RunStatus:
                 f"   target in ~{p['eta_target_s'] / 60:.0f} min" if p["eta_target_s"] else ""),
             f"ETA:    {eta}   likely end: {p['likely_end']}" + (f"   [{p['note']}]" if p["note"] else ""),
         ]
+        for h in self.hot_finds[:3]:
+            lines.append(f"HOT:    {h['discount_pct']:.1f}% off  {(h.get('title') or h['sku'])[:50]}  {h.get('url') or ''}")
         return Panel(Text("\n".join(lines)), title="PromoScoutBot", expand=False)

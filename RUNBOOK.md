@@ -24,11 +24,20 @@ cd C:\Users\pc\Documents\WORKSPACE\PROJECTS\bot-scrape-promo
 
 ## Run
 
+Pick one:
+
 ```powershell
-python -m promoscout run
-python -m promoscout run --resume
+# normal: batches forever, rests in between (Ctrl+C to stop)
 python -m promoscout auto
+
+# continue auto after Ctrl+C mid-batch
 python -m promoscout auto --resume
+
+# one batch only
+python -m promoscout run
+
+# finish one batch stopped with Ctrl+C
+python -m promoscout run --resume
 ```
 
 ## Check
@@ -41,8 +50,9 @@ python -m promoscout check
 
 ```powershell
 streamlit run review_app.py
-# http://localhost:8501
+# http://localhost:8501  (HOT banner = 95%+ finds, refreshes every 30 s)
 python -m promoscout export --out approved.csv
+Get-Content data/alerts.log -Wait
 ```
 
 ## Settings (.env)
@@ -50,10 +60,54 @@ python -m promoscout export --out approved.csv
 ```
 PROMOSCOUT_MAX_PRICE_NGN=20000
 PROMOSCOUT_MAX_OLD_PRICE_NGN=1000000
+PROMOSCOUT_ALERT_MIN_DISCOUNT=95
+PROMOSCOUT_FOCUS_BONUS=40
+PROMOSCOUT_PHONE_BONUS=20
+PROMOSCOUT_REVIEW_KEEP_MIN_DISCOUNT=90
+PROMOSCOUT_REVIEW_HIDE_AFTER_HOURS=48
 PROMOSCOUT_MAX_LINKS_PER_RUN=300
 PROMOSCOUT_MAX_RUNTIME_MINUTES=30
-PROMOSCOUT_AUTO_MIN_COOLDOWN_MINUTES=15
+PROMOSCOUT_TARGET_CANDIDATES=300
+PROMOSCOUT_AUTO_MIN_COOLDOWN_MINUTES=3
 PROMOSCOUT_AUTO_MAX_COOLDOWN_MINUTES=60
+PROMOSCOUT_AUTO_RETRY_MINUTES=2
+```
+
+## Email alerts (Gmail)
+
+1. Google Account > Security > 2-Step Verification: on
+2. Google Account > Security > App passwords: create one, copy the 16 letters
+3. `.env`:
+
+```
+PROMOSCOUT_EMAIL_ENABLED=true
+PROMOSCOUT_SMTP_USER=yourbot@gmail.com
+PROMOSCOUT_SMTP_PASSWORD=abcdabcdabcdabcd
+PROMOSCOUT_EMAIL_TO=jamesadewara1@gmail.com,jamesadewara3@gmail.com
+PROMOSCOUT_REVIEW_URL=http://localhost:8501
+```
+
+```powershell
+python -m promoscout test-email
+```
+
+```bash
+# server
+docker compose up -d
+docker compose exec bot python -m promoscout test-email
+```
+
+## Event days (Black Friday, 11.11, 12.12, anniversary)
+
+```
+PROMOSCOUT_AUTO_ALIGN_TO_HOUR=true
+PROMOSCOUT_RECHECK_LISTING_HOURS=1
+PROMOSCOUT_RECHECK_PRODUCT_QUALIFYING_HOURS=1
+```
+
+```bash
+# server: apply .env changes
+docker compose up -d
 ```
 
 ## Windows: start at logon
@@ -71,6 +125,23 @@ docker compose up -d --build
 docker compose logs -f bot
 docker compose exec bot python -m promoscout check
 docker compose down
+```
+
+## EC2 instance (AWS free plan)
+
+| Item | Pick |
+| --- | --- |
+| Instance | `t3.small` (2 vCPU, 2 GB, x86) |
+| Cheaper | `t3.micro` (1 GB): bot only, review on demand |
+| AMI | Amazon Linux 2023 |
+| Disk | 20 GB gp3 |
+| Region | `us-east-1` (N. Virginia) |
+| Security group | inbound 22 (SSH) and 8501 (review page) |
+| Elastic IP | yes |
+
+```bash
+# confirm free-plan types in your region
+aws ec2 describe-instance-types --filters Name=free-tier-eligible,Values=true --query "InstanceTypes[].InstanceType" --region us-east-1
 ```
 
 ## Server setup (Amazon Linux / EC2)
@@ -97,7 +168,7 @@ exit
 ## Server deploy
 
 ```bash
-git clone <your-repo-url> bot-scrape-promo
+git clone https://github.com/jamesadewara/bot-scrape-promo.git
 cd bot-scrape-promo
 cp .env.example .env
 docker compose up -d --build
@@ -117,12 +188,31 @@ docker compose stop review
 docker compose ps
 docker compose logs -f bot
 docker compose exec bot python -m promoscout check
+docker compose exec bot tail -f data/alerts.log
 ```
 
-## Server review (from your PC)
+## Server review (public IP)
+
+```
+# server .env
+PROMOSCOUT_REVIEW_PASSWORD=<long password>
+PROMOSCOUT_REVIEW_URL=http://<elastic-ip>:8501
+```
+
+```bash
+docker compose up -d
+```
+
+EC2 > Security groups > inbound rules > add: Custom TCP, port 8501, source 0.0.0.0/0
+
+```
+http://<elastic-ip>:8501
+```
+
+## Server review (SSH tunnel instead of public)
 
 ```powershell
-ssh -i your-key.pem -L 8501:localhost:8501 <user>@<server-ip>
+ssh -i your-key.pem -L 8501:localhost:8501 <user>@<elastic-ip>
 # http://localhost:8501
 ```
 
@@ -137,11 +227,27 @@ docker compose cp bot:/app/data/approved.csv ./approved.csv
 scp -i your-key.pem <user>@<server-ip>:bot-scrape-promo/approved.csv .
 ```
 
-## Server update
+## Server redeploy (after pushing a bot update)
+
+```powershell
+# PC
+git add -A
+git commit -m "update"
+git push
+```
 
 ```bash
-git pull
+# server
+cd ~/bot-scrape-promo
+bash deploy.sh
+```
+
+```bash
+# rollback to the previous version
+git log --oneline -5
+git checkout <commit>
 docker compose up -d --build
+git checkout main
 ```
 
 ## Server stop / start

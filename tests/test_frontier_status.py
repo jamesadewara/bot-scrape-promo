@@ -51,7 +51,8 @@ def test_link_priority_prefers_campaign_and_hot_parents():
     assert link_priority(B + "/mlp-black-friday/", None, False) > link_priority(B + "/tablets/", None, False)
     assert link_priority(B + "/tablets/", 90, False) > link_priority(B + "/tablets/", 10, False)
     assert link_priority(B + "/tablets/", None, True) > link_priority(B + "/tablets/", None, False)
-    assert link_priority(B + "/tablets/?page=9", None, False) < link_priority(B + "/tablets/", None, False)
+    # measured: deep listing pages hold more 80%+ items, so they rank higher
+    assert link_priority(B + "/tablets/?page=9", None, False) > link_priority(B + "/tablets/", None, False)
 
 
 def test_predictions_estimating_range_then_point():
@@ -74,3 +75,16 @@ def test_predictions_estimating_range_then_point():
     p = s.predictions()
     assert p["time_left_s"][0] < p["time_left_s"][1] and p["note"]   # slowdown widens the estimate
     assert "PromoScoutBot" in s.panel().title
+
+
+def test_focus_bonus_gadgets():
+    from promoscout.frontier import focus_bonus
+    from promoscout.settings import Settings
+    kw, b = Settings().focus_keywords, Settings().focus_bonus
+    for path in ("/phones-tablets/", "/smartphones/", "/tablets/apple/", "/electronics/flash-sales/",
+                 "/mlp-black-friday-oraimo-30000mah-power-bank/", "/headphones/", "/smart-watches/",
+                 "/samsung-galaxy-tab-s10-lite-418821809.html", "/laptops/hp/"):
+        assert focus_bonus(B + path, kw, b) == b, path
+    for path in ("/home-office/", "/groceries/", "/category-fashion-by-jumia/", "/storage-organization/",
+                 "/pineapple-juice-1234.html", "/fashion-accessories/"):
+        assert focus_bonus(B + path, kw, b) == 0, path

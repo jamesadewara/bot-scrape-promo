@@ -81,7 +81,7 @@ CREATE INDEX IF NOT EXISTS idx_requests_run ON requests(run_id);
 
 QUALIFYING_COLS = (
     "title", "price", "old_price", "currency", "source_page", "flags", "campaign_hint",
-    "rating_avg", "rating_count", "seller_score", "seller_quality", "stock_text",
+    "rating_avg", "rating_count", "seller_score", "seller_quality", "stock_text", "category",
 )
 
 
@@ -92,6 +92,11 @@ class Store:
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.executescript(SCHEMA)
+        cols = {r["name"] for r in self.db.execute("PRAGMA table_info(products)")}
+        if "alerted_at" not in cols:  # migration for databases created before hot-find alerts
+            self.db.execute("ALTER TABLE products ADD COLUMN alerted_at REAL")
+        if "category" not in cols:  # migration: product category for the review screen
+            self.db.execute("ALTER TABLE products ADD COLUMN category TEXT")
 
     def close(self) -> None:
         self.db.close()
@@ -197,8 +202,8 @@ class Store:
             first_seen_run = row["first_seen_run"]
             status = "updated"
         review_status = row["review_status"] if row is not None and row["review_status"] else "pending"
-        # 6.1: a rejected product is shown again only if its price or old price changed
-        if row is not None and review_status == "rejected" and (
+        # 6.1: a rejected (or auto-hidden) product is shown again only if its price or old price changed
+        if row is not None and review_status in ("rejected", "hidden") and (
             values["price"] != row["reviewed_price"] or values["old_price"] != row["reviewed_old_price"]
         ):
             review_status = "pending"
@@ -216,18 +221,39 @@ class Store:
                             [sku, *cols.values()])
         else:
             # keep earlier review hints when this sighting (e.g. a card) lacks them
-            for k in ("rating_avg", "rating_count", "seller_score", "seller_quality", "stock_text", "campaign_hint"):
+            for k in ("rating_avg", "rating_count", "seller_score", "seller_quality", "stock_text", "campaign_hint",
+                      "category"):
                 if cols.get(k) is None:
                     cols[k] = row[k]
             sets = ",".join(f"{k}=?" for k in cols)
             self.db.execute(f"UPDATE products SET {sets} WHERE sku=?", [*cols.values(), sku])
         return status
 
+    def auto_hide(self, hide_after_hours: float, keep_min_discount: float, stale_hours: float,
+                  now: float | None = None) -> int:
+        """Hide unreviewed finds the reviewer does not need:
+        - below keep_min_discount and first seen more than hide_after_hours ago
+        - not seen for more than stale_hours (deal probably ended)
+        Hidden items keep their price snapshot; they come back only if price or old price changes."""
+        now = now or time.time()
+        cur = self.db.execute(
+            "UPDATE products SET review_status='hidden', reviewed_at=?, reviewed_price=price, "
+            "reviewed_old_price=old_price WHERE qualifies=1 AND COALESCE(review_status,'pending')='pending' "
+            "AND ((first_seen < ? AND discount_pct < ?) OR last_seen < ?)",
+            (now, now - hide_after_hours * 3600, keep_min_discount, now - stale_hours * 3600))
+        return cur.rowcount
+
+    def mark_alerted(self, sku: str) -> bool:
+        """True the first time a product is alerted; False if it was alerted before."""
+        cur = self.db.execute("UPDATE products SET alerted_at=? WHERE sku=? AND alerted_at IS NULL",
+                              (time.time(), sku))
+        return cur.rowcount == 1
+
     def mark_gone(self, sku: str) -> None:
         self.db.execute("UPDATE products SET qualifies=0 WHERE sku=?", (sku,))
 
     def set_review(self, sku: str, status: str) -> None:
-        assert status in ("approved", "rejected", "unsure", "pending")
+        assert status in ("approved", "rejected", "unsure", "pending", "hidden")
         self.db.execute(
             "UPDATE products SET review_status=?, reviewed_at=?, reviewed_price=price, reviewed_old_price=old_price WHERE sku=?",
             (status, time.time(), sku))

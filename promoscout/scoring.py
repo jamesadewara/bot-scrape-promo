@@ -89,3 +89,32 @@ def review_sort_key(p: dict) -> tuple:
 def in_price_range(price: float | None, old_price: float | None, max_price: float, max_old_price: float) -> bool:
     """Operator price filter: price < max_price OR old price < max_old_price (strictly less)."""
     return (price is not None and price < max_price) or (old_price is not None and old_price < max_old_price)
+
+
+_STOP = {"with", "and", "for", "the", "new", "inch", "pack", "set", "of", "in", "to", "gb", "ram", "rom",
+         "black", "white", "blue", "red", "pink", "grey", "gray", "gold", "silver", "green", "men", "women"}
+
+
+def _tokens(title: str | None) -> set[str]:
+    words = re.findall(r"[a-z][a-z0-9]{2,}", (title or "").lower())
+    return {w for w in words if w not in _STOP}
+
+
+def inflated_old_price(cand, peers, factor: float) -> bool:
+    """Old price more than `factor` x the median selling price of similar items on the same page.
+
+    Similar = shares at least 2 meaningful title words. Needs 3+ similar items, else no verdict.
+    Pure in-memory comparison: nothing is stored and no request is made.
+    """
+    if not factor or cand.old_price is None:
+        return False
+    mine = _tokens(cand.title)
+    if len(mine) < 2:
+        return False
+    prices = sorted(p.price for p in peers
+                    if p is not cand and p.sku != cand.sku and p.price
+                    and len(mine & _tokens(p.title)) >= 2)
+    if len(prices) < 3:
+        return False
+    median = prices[len(prices) // 2]
+    return cand.old_price > factor * median

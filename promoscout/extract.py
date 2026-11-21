@@ -17,7 +17,9 @@ from .urls import normalize, page_type
 
 STORE_MARKER = "window.__STORE__"
 CAMPAIGN_TEXT_RE = re.compile(
-    r"black[\s-]?friday|flash[\s-]?sale|deal|clearance|% ?off|mega[\s-]?sale|promo|blf\d*", re.I
+    r"black[\s-]?friday|flash[\s-]?sale|deal|clearance|% ?off|mega[\s-]?sale|promo|blf\d*"
+    r"|treasure[\s-]?hunt|snatch|anniversary|11[.:\s-]?11|12[.:\s-]?12|price[\s-]?drop|crazy|giveaway"
+    r"|9\d ?%", re.I
 )
 CAMPAIGN_IMG_RE = re.compile(r"(BLF\d+|black-friday/\d{4})", re.I)
 DELIVERY_RE = re.compile(r"within the next \d+\s*hrs?", re.I)
@@ -34,6 +36,7 @@ class Candidate:
     cross_checks: list[float | None] = field(default_factory=list)
     price_from: bool = False
     campaign_hint: str | None = None
+    category: str | None = None  # e.g. "Phones & Tablets > Tablets > Android Tablets"
     rating_avg: float | None = None
     rating_count: int | None = None
     stock_text: str | None = None
@@ -150,6 +153,7 @@ def _candidate_from_json(p: dict, source: str) -> Candidate:
         cross_checks=[parse_percent(prices.get("discount")), parse_percent(display.get("discount"))],
         price_from=price_text.lower().startswith("from"),
         campaign_hint=_tags_hint(p.get("tags"), badge),
+        category=" > ".join(str(x) for x in (p.get("categories") or []) if x) or None,
         rating_avg=rating.get("average"),
         rating_count=rating.get("totalRatings"),
         stock_text=stock,
@@ -209,6 +213,8 @@ def parse_cards(tree: LexborHTMLParser | object, root=None) -> list[Candidate]:
             cross_checks=[badge_val],
             price_from=price_text.lower().startswith("from"),
             campaign_hint=_tags_hint(tags, _txt(camp)),
+            category=" > ".join(x.strip() for x in (a.attributes.get("data-gtm-category") or "").split("/")
+                                if x.strip()) or None,
             rating_avg=parse_naira(_txt(a.css_first(".rv-avg"))),
             rating_count=int(parse_naira(_txt(a.css_first(".rv-cnt"))) or 0) or None,
         ))
@@ -352,6 +358,8 @@ def _extract_listing(store: dict | None, cards: list[Candidate]) -> list[Candida
             by_sku[c.sku] = c
             continue
         j.cross_checks.extend(c.cross_checks)
+        if not j.category and c.category:
+            j.category = c.category
         if j.old_price is None and c.old_price is not None:
             j.old_price = c.old_price
         if j.price is None:

@@ -12,15 +12,18 @@ import structlog
 
 from .extract import PageResult, extract
 from .fetcher import Fetcher, FetchResult, Outcome
-from .frontier import TIER_NEW, TIER_OTHER, TIER_STALE_QUALIFYING, Entry, Frontier, link_priority, section_for
+from .frontier import (TIER_NEW, TIER_OTHER, TIER_STALE_QUALIFYING, Entry, Frontier, focus_bonus,
+                       link_priority, section_for)
 from .ratelimit import RateLimiter
 from .robots import Robots
 from .settings import PRUNE_MIN_DISCOUNT, ROBOTS_URL, Settings
-from .scoring import in_price_range
+from .scoring import in_price_range, inflated_old_price
 from .sitemaps import child_sitemap_rank, parse_sitemap
 from .status import RunStatus
 from .store import Store
-from .urls import is_asset, normalize, page_type
+from urllib.parse import urlsplit
+
+from .urls import has_filter_params, is_asset, normalize, page_family, page_number, page_type
 
 log = structlog.get_logger("promoscout")
 
@@ -75,6 +78,10 @@ class Crawler:
         self.hint_page_total = 0
         self._deadline = 0.0
         self.seeded = False
+        self.family_pages: dict[str, int] = {}
+        self.family_bonus: dict[str, float] = {}
+        self.family_suppressed: set[str] = set()
+        self.family_best: dict[str, float] = {}
         self.rediscover = False
         self.type_bonus: dict[str, float] = {}
         self.hot_sections: dict[str, float] = {}
@@ -129,6 +136,13 @@ class Crawler:
                                           "bytes_by_type": self.status.bytes_by_type})
             except Exception as exc:  # noqa: BLE001
                 log.error("end_run_failed", error=str(exc))
+            try:
+                hidden = self.store.auto_hide(self.s.review_hide_after_hours, self.s.review_keep_min_discount,
+                                              self.s.review_stale_hours)
+                if hidden:
+                    log.info("auto_hidden", count=hidden)
+            except Exception as exc:  # noqa: BLE001
+                log.error("auto_hide_failed", error=str(exc))
             # F11: save what is left to fetch. A run that never got past robots.txt/seeding must NOT
             # overwrite the queue saved by earlier runs.
             if self.seeded:
@@ -183,6 +197,10 @@ class Crawler:
             if not u:
                 raise StopRun("stopped (error)", f"seed is not a jumia.com.ng URL: {seed}")
             self._enqueue(u, depth=0, priority=400, parent_section=None, reason="seed")
+        for path in self.s.promo_seed_paths:  # known campaign pages (research), robots + due checks apply
+            u = normalize(path)
+            if u:
+                self._enqueue(u, depth=0, priority=350, parent_section=None, reason="promo_seed")
         if use_sitemaps:
             for sm in self.robots.sitemaps:  # C7
                 self._enqueue(sm, depth=0, priority=300, parent_section=None, reason="sitemap")
@@ -191,6 +209,8 @@ class Crawler:
                 # discovers pages it has never fetched, instead of sitting idle.
                 self.rediscover = True
                 for sm in self.robots.sitemaps:
+                    self.frontier.visited.pop(sm, None)  # was just marked "skipped_recent"
+                    self.status.skipped_recent = max(0, self.status.skipped_recent - 1)
                     self._enqueue(sm, depth=0, priority=300, parent_section=None, reason="rediscover")
                 log.info("rediscover", queued=len(self.frontier))
         if not len(self.frontier):
@@ -214,17 +234,60 @@ class Crawler:
         for k, (n, h) in totals.items():
             if n >= 10:  # only trust a measurement over at least 10 pages
                 self.type_bonus[k] = min(20.0, 100.0 * h / n)  # +1 per hit per 100 pages, max +20
+        # 6.7 per family of pages: qualifying finds per fetched listing/campaign page
+        self.family_bonus: dict[str, float] = {}
+        self.family_suppressed: set[str] = set()
+        pages_per_fam: dict[str, int] = {}
+        since = time.time() - self.s.learn_window_days * 86400  # recent only: events come and go
+        for (url,) in self.store.db.execute(
+                "SELECT url FROM pages WHERE page_type IN ('listing','campaign') AND last_fetched >= ?", (since,)):
+            fam = page_family(url)
+            pages_per_fam[fam] = pages_per_fam.get(fam, 0) + 1
+        finds_per_fam: dict[str, int] = {}
+        for (src,) in self.store.db.execute(
+                "SELECT source_page FROM products WHERE qualifies=1 AND first_seen >= ?", (since,)):
+            if src:
+                fam = page_family(src)
+                finds_per_fam[fam] = finds_per_fam.get(fam, 0) + 1
+        for fam, n in pages_per_fam.items():
+            yield_ = finds_per_fam.get(fam, 0) / n
+            if n >= 3 and yield_ > 0:
+                self.family_bonus[fam] = min(self.s.learn_max_bonus, yield_ * self.s.learn_bonus_per_find)
+            if n >= self.s.learn_min_pages_for_penalty and yield_ < self.s.learn_poor_yield:
+                # proven poor: penalty, and gadget/phone focus no longer lifts it
+                self.family_bonus[fam] = -self.s.learn_penalty
+                self.family_suppressed.add(fam)
         self.hot_sections: dict[str, float] = {}
         for url, best in self.store.db.execute(
                 "SELECT url, best_discount FROM pages WHERE best_discount >= ? AND page_type IN ('listing','campaign')",
                 (PRUNE_MIN_DISCOUNT,)):
             sec = section_for(url, None)
             self.hot_sections[sec] = max(self.hot_sections.get(sec, 0.0), best)
-        if self.type_bonus or self.hot_sections:
-            log.info("history_loaded", type_bonus=self.type_bonus, hot_sections=len(self.hot_sections))
+        if self.type_bonus or self.hot_sections or self.family_bonus:
+            log.info("history_loaded", type_bonus=self.type_bonus, hot_sections=len(self.hot_sections),
+                     families=len(self.family_bonus),
+                     best=sorted(self.family_bonus.items(), key=lambda x: -x[1])[:5],
+                     worst=sorted(self.family_bonus.items(), key=lambda x: x[1])[:5])
+
+    def _family_open(self, url: str) -> bool:
+        fam = page_family(url)
+        if self.family_best.get(fam, 0.0) >= 79.5 or self.hot_sections.get(fam, 0.0) >= 79.5:
+            return True  # a family that produced 80%+ finds stays open
+        return self.family_pages.get(fam, 0) < self.s.family_cap_per_run
+
+    def _focus(self, url: str) -> float:
+        """Gadget/phone focus plus what past batches learned about this family of pages."""
+        fam = page_family(url)
+        learned = self.family_bonus.get(fam, 0.0)
+        if fam in self.family_suppressed:
+            return learned
+        return (focus_bonus(url, self.s.focus_keywords, self.s.focus_bonus)
+                + focus_bonus(url, self.s.phone_keywords, self.s.phone_bonus) + learned)
 
     def _history_bonus(self, url: str, kind: str, section: str) -> float:
         bonus = self.type_bonus.get(kind, 0.0)
+        if kind != "sitemap":
+            bonus += self._focus(url)  # gadgets and phones first
         best = self.hot_sections.get(section)
         if best is not None:
             bonus += 10.0 if best >= 79.5 else 4.0
@@ -248,6 +311,9 @@ class Crawler:
             self.status.skipped_robots += 1
             self.frontier.mark_visited(url, "disallowed")
             log.info("robots_skip", url=url, robots="disallow", stage="enqueue")
+            return False
+        if page_type(url) in ("listing", "campaign") and has_filter_params(url):
+            self.frontier.mark_visited(url, "filter_variant")  # ?official_store= etc: subset of a page we read
             return False
         if is_asset(url):  # 2.2: no images or other assets, ever
             self.frontier.mark_visited(url, "asset")
@@ -314,6 +380,10 @@ class Crawler:
                 self.frontier.mark_visited(e.url, "disallowed")
                 log.info("robots_skip", url=e.url, robots="disallow", stage="fetch")
                 continue
+            if (e.kind in ("listing", "campaign") and e.reason not in ("seed", "promo_seed")
+                    and not self._family_open(e.url)):
+                self.frontier.mark_visited(e.url, "family_cap")  # look-alike page: no request spent
+                continue
             if not self._due(e.url) and not (self.rediscover and e.kind == "sitemap"):  # memory across runs
                 self.status.skipped_recent += 1
                 self.frontier.mark_visited(e.url, "skipped_recent")
@@ -341,8 +411,9 @@ class Crawler:
 
     async def _process(self, e: Entry) -> None:
         row = self.store.get_page(e.url)
-        etag = row["etag"] if row else None
-        lastmod = row["last_modified"] if row else None
+        # no conditional request for sitemaps: a 304 has no body, and the URLs inside are needed
+        etag = row["etag"] if row and e.kind != "sitemap" else None
+        lastmod = row["last_modified"] if row and e.kind != "sitemap" else None
         kind_label = {"campaign": "campaign", "listing": "listing", "product": "product",
                       "sitemap": "sitemap"}.get(e.kind, e.kind)
         attempt = 0
@@ -486,6 +557,8 @@ class Crawler:
         body = res.body or ""
         digest = hashlib.sha256(body.encode("utf-8", "replace")).hexdigest() if body else None
         unchanged = res.outcome == Outcome.NOT_MODIFIED or (digest and prev is not None and prev["content_hash"] == digest)
+        if e.kind == "sitemap" and res.outcome != Outcome.NOT_MODIFIED:
+            unchanged = False  # always parse sitemaps: they are where URLs come from (dedupe happens at enqueue)
         next_at = now + self._recheck_hours(e, prev["best_discount"] if prev else None) * h
         if unchanged and prev is not None:
             # F12: identical content: skip parsing, keep the earlier result, push next_check_at forward
@@ -516,6 +589,10 @@ class Crawler:
             next_check_at=next_at, sitemap_lastmod=self.sitemap_lastmod.get(e.url))
         self._update_prune(e, page)
         self._queue_links(e, page)
+        fam = page_family(e.url)
+        self.family_pages[fam] = self.family_pages.get(fam, 0) + 1
+        if best is not None:
+            self.family_best[fam] = max(self.family_best.get(fam, 0.0), best)
         self.status.page_done(e.kind, nbytes, new_hits)
 
     def _recheck_hours(self, e: Entry, best: float | None) -> float:
@@ -524,7 +601,7 @@ class Crawler:
             return self.s.recheck_listing_hours
         prow = self.store.db.execute("SELECT review_status FROM products WHERE url=? AND qualifies=1",
                                      (e.url,)).fetchone()
-        if prow is not None and prow["review_status"] == "rejected":
+        if prow is not None and prow["review_status"] in ("rejected", "hidden"):
             return self.s.recheck_rejected_days * 24
         if best is not None and best >= 79.5:
             return self.s.recheck_product_qualifying_hours  # also covers approved (6-hour re-verify)
@@ -543,12 +620,15 @@ class Crawler:
             seen.add(c.sku)
             v = c.verdict
             qualifies = v.approved and self._price_ok(c.price, c.old_price)
+            if (qualifies and "old_price_inflated" not in v.flags
+                    and inflated_old_price(c, candidates, self.s.inflation_factor)):
+                v.flags.append("old_price_inflated")
             on_product_page = page.kind == "product" and c in page.products
             q = dict(
                 title=c.title, price=c.price, old_price=c.old_price, currency="NGN", source_page=e.url,
                 flags=v.flags, campaign_hint=c.campaign_hint, rating_avg=c.rating_avg,
                 rating_count=c.rating_count, seller_score=c.seller_score, seller_quality=c.seller_quality,
-                stock_text=c.stock_text,
+                stock_text=c.stock_text, category=c.category,
                 card_seen_at=None if on_product_page else (now if c.has_old_price else None),
                 product_page_checked_at=now if on_product_page else None,
             )
@@ -562,7 +642,22 @@ class Crawler:
                     new_hits += 1
                     self.status.new_qualifying += 1
                     log.info("new_qualifying", sku=c.sku, discount=v.discount_pct, url=c.url, flags=v.flags)
+                if (v.discount_pct or 0) >= self.s.alert_min_discount and self.store.mark_alerted(c.sku):
+                    self._hot_find(c, v, e.url)
         return new_hits
+
+    def _hot_find(self, c, v, source: str) -> None:
+        """Alert once per product: alerts.log, status.json / live panel, and the request log."""
+        rec = {"ts": time.time(), "time": time.strftime("%Y-%m-%d %H:%M:%S"), "sku": c.sku,
+               "discount_pct": v.discount_pct, "price": c.price, "old_price": c.old_price,
+               "title": c.title, "url": c.url, "flags": v.flags, "source_page": source}
+        self.status.hot_finds = ([rec] + self.status.hot_finds)[:10]
+        try:
+            with open(self.s.alerts_path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        except OSError:
+            pass
+        log.warning("hot_find", **{k: rec[k] for k in ("sku", "discount_pct", "price", "old_price", "url")})
 
     def _price_ok(self, price: float | None, old_price: float | None) -> bool:
         return in_price_range(price, old_price, self.s.max_price_ngn, self.s.max_old_price_ngn)
@@ -592,50 +687,101 @@ class Crawler:
                 useful = True
         return useful
 
+    def _next_page_url(self, e: Entry, page: PageResult) -> str | None:
+        """The ?page=N+1 link of the listing being read, if the page links to it."""
+        if e.kind not in ("listing", "campaign"):
+            return None
+        base = urlsplit(e.url)
+        want = page_number(e.url) + 1
+        for link in page.links:
+            u = urlsplit(link.url)
+            if u.path == base.path and page_number(link.url) == want:
+                return link.url
+        return None
+
     def _queue_links(self, e: Entry, page: PageResult) -> None:
-        if e.depth >= self.s.max_depth:
-            return
+        """Pick the best max_outlinks_per_page links from this page (6.4), with a fair mix:
+        1. the next page of this listing (paging inside one listing is not a new hop),
+        2. product pages only when needed (6.3: missing old price, or verifying an 80%+ find),
+        3. campaign and listing pages, each kind limited to half of the remaining slots so one
+           kind (e.g. dozens of single-product mlp- pages in a menu) cannot crowd out the rest.
+        """
         now = time.time()
         h = 3600.0
         parent_best = page.best_discount
         page_hint = self._page_hints(page)
-        options: list[tuple[float, str, str]] = []
-        # navigation: listing and campaign pages
-        for link in page.links:
-            k = page_type(link.url)
-            if k not in ("listing", "campaign"):
-                continue
-            if self.frontier.seen(link.url):
-                continue
-            options.append((link_priority(link.url, parent_best, link.campaign_hint, page_hint), link.url, ""))
-        # product pages only when needed (6.3)
+        budget = self.s.max_outlinks_per_page
+        pushed = 0
+
+        nxt = self._next_page_url(e, page)
+        if nxt and not self.frontier.seen(nxt):
+            pr = link_priority(nxt, parent_best, False, page_hint) + 20
+            if self._enqueue(nxt, depth=e.depth, priority=pr, parent_section=e.section,
+                             reason="next_page", parent=e.url):
+                pushed += 1
+
+        # product pages only when needed (6.3); verifying a find is not discovery, so any depth
+        products: list[tuple[float, str, str]] = []
         for c in page.products if page.kind != "product" else []:
             if not c.url or c.verdict is None:
                 continue
             reason = None
             row = self.store.get_product(c.sku)
             if not c.has_old_price:
-                # skip if a card with old price data was read within the revisit window
-                if row is not None and row["card_seen_at"] and \
-                        now - row["card_seen_at"] < self.s.recheck_product_below_hours * h:
-                    continue
+                if row is not None and row["card_seen_at"] and                         now - row["card_seen_at"] < self.s.recheck_product_below_hours * h:
+                    continue  # a card with old price data was read within the revisit window
                 reason = "no_old_price"
             elif c.verdict.approved and self._price_ok(c.price, c.old_price):
-                if row is not None and row["product_page_checked_at"] and \
-                        now - row["product_page_checked_at"] < self.s.recheck_product_qualifying_hours * h:
+                if (row is not None and row["review_status"] in ("hidden", "rejected")
+                        and row["price"] == c.price and row["old_price"] == c.old_price):
+                    continue  # memo: hidden/rejected and unchanged -> no request spent on it
+                if row is not None and row["product_page_checked_at"] and                         now - row["product_page_checked_at"] < self.s.recheck_product_qualifying_hours * h:
                     continue
                 reason = "verify"
             if reason:
-                pr = link_priority(c.url, parent_best, False) + (c.verdict.discount_pct or 0) * (
-                    1.0 if reason == "verify" else 0.3)
-                options.append((pr, c.url, reason))
-        options.sort(key=lambda o: -o[0])
-        pushed = 0
-        for pr, url, reason in options:
-            if pushed >= self.s.max_outlinks_per_page:
-                break
+                pr = link_priority(c.url, parent_best, False) + self._focus(c.url) + (
+                    c.verdict.discount_pct or 0) * (1.0 if reason == "verify" else 0.3)
+                products.append((pr, c.url, reason))
+        products.sort(key=lambda o: -o[0])
+        for pr, url, reason in products:
+            if pushed >= budget:
+                return
             if self._enqueue(url, depth=e.depth + 1, priority=pr, parent_section=e.section, reason=reason,
                              parent=e.url):
+                pushed += 1
+
+        if e.depth >= self.s.max_depth:
+            return  # max_depth: no new navigation hops from here
+        nav: dict[str, list[tuple[float, str]]] = {"campaign": [], "listing": []}
+        for link in page.links:
+            k = page_type(link.url)
+            if k not in nav or link.url == nxt or self.frontier.seen(link.url):
+                continue
+            if has_filter_params(link.url):
+                continue  # ?official_store= / ?damage_grade= ...: a subset of a page we read anyway
+            if not self._family_open(link.url):
+                continue  # this family of look-alike pages already had its share this batch
+            if not self.robots.allowed(link.url) or is_asset(link.url) or not self._due(link.url):
+                # rejected links must not take a slot; _enqueue records why (robots / recently checked)
+                self._enqueue(link.url, depth=e.depth + 1, priority=0, parent_section=e.section)
+                continue
+            nav[k].append((link_priority(link.url, parent_best, link.campaign_hint, page_hint)
+                           + self._focus(link.url), link.url))
+        for lst in nav.values():
+            lst.sort(key=lambda o: -o[0])
+        left = budget - pushed
+        per_kind = max(1, (left + 1) // 2)
+        chosen: list[tuple[float, str]] = []
+        rest: list[tuple[float, str]] = []
+        for lst in nav.values():
+            chosen += lst[:per_kind]
+            rest += lst[per_kind:]
+        chosen.sort(key=lambda o: -o[0])
+        rest.sort(key=lambda o: -o[0])
+        for pr, url in chosen + rest:  # unused slots of one kind go to the other
+            if pushed >= budget:
+                break
+            if self._enqueue(url, depth=e.depth + 1, priority=pr, parent_section=e.section, parent=e.url):
                 pushed += 1
 
     def _handle_sitemap(self, e: Entry, body: str) -> None:

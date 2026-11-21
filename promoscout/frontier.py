@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import heapq
+from urllib.parse import urlsplit
 import itertools
 import json
 import re
 from dataclasses import asdict, dataclass
 
-from .urls import page_number, page_type, section_of
+from .urls import page_number, page_type, path_depth, section_of
 
 # Run order (6.1): never-seen first, then stale qualifying products, then everything else due.
 TIER_NEW, TIER_STALE_QUALIFYING, TIER_OTHER = 0, 1, 2
@@ -20,6 +21,11 @@ PATTERN_SCORE = {
     "other": 0,
 }
 PROMO_PATH_RE = re.compile(r"/(flash-sales|mlp-black-friday|mlp-[^/]+)/")
+BLACK_FRIDAY_RE = re.compile(r"black-friday|blackfriday", re.I)
+# Deep-discount campaign words (research 2026-11-21): treasure hunts hide single items at 99% off;
+# clearance / anniversary / 11.11 / 12.12 / snatch-it pages carry the steepest markdowns.
+DEEP_PROMO_RE = re.compile(
+    r"treasure|clearance|snatch|anniversary|11-11|12-12|price-drop|crazy|giveaway|flash-sale", re.I)
 
 
 @dataclass
@@ -40,8 +46,16 @@ def link_priority(url: str, parent_best: float | None, anchor_hint: bool, page_h
     score = PATTERN_SCORE.get(kind, 0)
     if PROMO_PATH_RE.search(url):
         score += 15
+    if BLACK_FRIDAY_RE.search(url):
+        score += 5  # 5.3: /mlp-black-friday/ named as a high-priority promo pattern
+    if DEEP_PROMO_RE.search(url):
+        score += 10
     if kind == "listing":
-        score -= min(20, (page_number(url) - 1) * 2)  # later pages of a listing slightly lower
+        # measured 2026-11-22: pages with an 80%+ item were 17% on page 1, 42% on pages 4-10 and
+        # 72% on pages 11+ (clearance stock sinks to the back of a listing), so deeper pages rank higher
+        score += min(20, (page_number(url) - 1) * 2)
+        if path_depth(url) == 2:
+            score -= 8  # brand-in-category pages: narrower than the category itself
     score += (parent_best or 0) * 0.5
     if anchor_hint:
         score += 10
@@ -122,3 +136,19 @@ class Frontier:
 def section_for(url: str, parent_section: str | None) -> str:
     """Products inherit the section of the listing they were found on."""
     return parent_section if page_type(url) == "product" and parent_section else section_of(url)
+
+
+def focus_bonus(url: str, keywords: list[str], bonus: float) -> float:
+    """+bonus if any path segment (or hyphen-joined part of one) matches a focus keyword."""
+    if not keywords or not bonus:
+        return 0.0
+    path = urlsplit(url).path.lower().strip("/")
+    if not path:
+        return 0.0
+    segments = [seg.removesuffix(".html") for seg in path.split("/")]
+    words = {w for seg in segments for w in seg.split("-")}
+    for kw in keywords:
+        kw = kw.lower().strip("/")
+        if (("-" in kw and any(kw in seg for seg in segments)) or kw in segments or kw in words):
+            return bonus
+    return 0.0

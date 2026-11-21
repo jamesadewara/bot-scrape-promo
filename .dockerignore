@@ -11,3 +11,4 @@ __pycache__
 approved.csv
 RUNBOOK.md
 run_auto.ps1
+deploy.sh

@@ -12,8 +12,15 @@ TRACKING_KEYS = {
     "ref", "referrer", "source", "tkwl", "tkfs", "spm",
 }
 
-PRODUCT_RE = re.compile(r"-\d+\.html$")
-CAMPAIGN_RE = re.compile(r"^/(mlp-[^/]+|sp-[^/]+|flash-sales)/$")
+# product pages: /name-419065810.html and product-group pages /name-mpg12085122.html
+PRODUCT_RE = re.compile(r"-(?:mpg)?\d+\.html$")
+# campaign pages (5.3 promo patterns): /mlp-*/, /flash-sales/ and per-category /<category>/flash-sales/
+CAMPAIGN_RE = re.compile(r"^/(?:mlp-[^/]+|flash-sales|[a-z0-9][a-z0-9-]*/flash-sales)/$")
+SEG = r"[a-z0-9][a-z0-9\-]*"
+# listing pages: /tablets/ and brand-in-category /tablets/apple/ (robots.txt still decides per URL)
+LISTING_RE = re.compile(rf"^/{SEG}/(?:{SEG}/)?$")
+NOT_LISTING_FIRST = ("sp-", "blog", "customer", "cart", "catalog", "checkout", "wishlist", "en", "ur",
+                     "assets", "fragment", "recommendation", "suggestion", "ratingreview", "mobapi")
 
 
 def normalize(url: str, base: str = BASE_URL) -> str | None:
@@ -54,10 +61,16 @@ def page_type(url: str) -> str:
         return "product"
     if CAMPAIGN_RE.match(path):
         return "campaign"
-    # one-segment category paths like /tablets/ (paging via ?page=N stays a listing)
-    if re.fullmatch(r"/[a-z0-9][a-z0-9\-]*/", path) and not path.startswith("/blog/"):
-        return "listing"
+    # category paths like /tablets/ and /tablets/apple/ (paging via ?page=N stays a listing)
+    if LISTING_RE.match(path):
+        first = path.strip("/").split("/")[0]
+        if not first.startswith(NOT_LISTING_FIRST[0]) and first not in NOT_LISTING_FIRST[1:]:
+            return "listing"
     return "other"
+
+
+def path_depth(url: str) -> int:
+    return len([x for x in urlsplit(url).path.split("/") if x])
 
 
 def section_of(url: str) -> str:
@@ -81,3 +94,19 @@ def is_asset(url: str) -> bool:
     """2.2: the bot never fetches images or other assets."""
     path = urlsplit(url).path
     return bool(ASSET_RE.search(path)) or path.startswith(("/assets", "/cdn-cgi/"))
+
+
+# query keys that only filter/sort the same listing; paging (?page=N) is the one we follow
+FOLLOW_QUERY_KEYS = {"page"}
+
+
+def has_filter_params(url: str) -> bool:
+    """True if the URL has query parameters other than ?page= (filtered copy of a page)."""
+    return any(k not in FOLLOW_QUERY_KEYS for k, _ in parse_qsl(urlsplit(url).query, keep_blank_values=True))
+
+
+def page_family(url: str) -> str:
+    """Family of look-alike pages: first path segment cut to its first two words.
+    /mlp-samsung-galaxy-s4/ and /mlp-samsung-j2-core/ -> "mlp-samsung"; /tablets/apple/ -> "tablets"."""
+    first = urlsplit(url).path.strip("/").split("/")[0]
+    return "-".join(first.split("-")[:2]) if first else "/"
