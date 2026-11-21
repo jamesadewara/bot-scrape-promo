@@ -61,3 +61,12 @@ def test_ranking_order():
         {"sku": "e", "discount_pct": 85, "is_new": False, "campaign_hint": "BLF", "last_seen_ts": 9},
     ]
     assert [r["sku"] for r in sorted(rows, key=review_sort_key)] == ["b", "c", "e", "d", "a"]
+
+
+def test_price_filter_or_rule():
+    from promoscout.scoring import in_price_range
+    assert in_price_range(15_000, 2_000_000, 20_000, 1_000_000)        # price under 20k
+    assert in_price_range(50_000, 400_000, 20_000, 1_000_000)          # old price under 1M
+    assert not in_price_range(102_999, 1_200_000, 20_000, 1_000_000)   # neither
+    assert not in_price_range(20_000, 1_000_000, 20_000, 1_000_000)    # limits are strict "<"
+    assert not in_price_range(None, None, 20_000, 1_000_000)

@@ -119,6 +119,15 @@ class Store:
         midnight = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1))
         return self.db.execute("SELECT COUNT(*) FROM runs WHERE started_at >= ?", (midnight,)).fetchone()[0]
 
+    def close_stale_runs(self) -> None:
+        """Mark runs that never finished (process killed) as interrupted, ended at their last request."""
+        for (rid,) in self.db.execute("SELECT id FROM runs WHERE ended_at IS NULL").fetchall():
+            last = self.db.execute("SELECT MAX(ts), COUNT(*) FROM requests WHERE run_id=?", (rid,)).fetchone()
+            self.db.execute(
+                "UPDATE runs SET ended_at=COALESCE(?, started_at), state='stopped (interrupted)', "
+                "reason='process ended before the run finished', requests=? WHERE id=?",
+                (last[0], last[1], rid))
+
     def start_run(self) -> int:
         cur = self.db.execute("INSERT INTO runs(started_at, state) VALUES(?, 'running')", (time.time(),))
         return int(cur.lastrowid)
@@ -223,10 +232,16 @@ class Store:
             "UPDATE products SET review_status=?, reviewed_at=?, reviewed_price=price, reviewed_old_price=old_price WHERE sku=?",
             (status, time.time(), sku))
 
-    def qualifying(self) -> list[dict]:
+    def qualifying(self, max_price: float | None = None, max_old_price: float | None = None) -> list[dict]:
+        """Qualifying products; with limits, only those inside the price filter (price OR old price)."""
         rows = self.db.execute("SELECT * FROM products WHERE qualifies=1").fetchall()
         out = []
         for r in rows:
+            if max_price is not None and max_old_price is not None and not (
+                (r["price"] is not None and r["price"] < max_price)
+                or (r["old_price"] is not None and r["old_price"] < max_old_price)
+            ):
+                continue
             d = dict(r)
             d["flags"] = json.loads(d["flags"] or "[]")
             d["last_seen_ts"] = d["last_seen"]

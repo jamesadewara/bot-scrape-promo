@@ -16,6 +16,7 @@ from .frontier import TIER_NEW, TIER_OTHER, TIER_STALE_QUALIFYING, Entry, Fronti
 from .ratelimit import RateLimiter
 from .robots import Robots
 from .settings import PRUNE_MIN_DISCOUNT, ROBOTS_URL, Settings
+from .scoring import in_price_range
 from .sitemaps import child_sitemap_rank, parse_sitemap
 from .status import RunStatus
 from .store import Store
@@ -73,6 +74,8 @@ class Crawler:
         self.hint_pages: dict[str, int] = {}
         self.hint_page_total = 0
         self._deadline = 0.0
+        self.seeded = False
+        self.rediscover = False
         self.type_bonus: dict[str, float] = {}
         self.hot_sections: dict[str, float] = {}
 
@@ -89,6 +92,7 @@ class Crawler:
             log.warning("run_refused", reason=reason)
             return RunSummary(None, "refused", reason, 0, 0, 0)
 
+        self.store.close_stale_runs()  # runs killed mid-way (e.g. second Ctrl+C) no longer show "running"
         self.run_id = self.store.start_run()
         self.status.run_id = self.run_id
         self._deadline = time.monotonic() + self.s.max_runtime_minutes * 60
@@ -97,6 +101,8 @@ class Crawler:
         try:
             await self._load_robots()
             self._seed(seed, use_sitemaps, resume)
+            self.seeded = True
+            self.store.set_kv("checkpoint", self.frontier.to_json())  # queue is safe from the start
             workers = [asyncio.create_task(self._worker(i)) for i in range(self.s.max_concurrency)]
             await asyncio.gather(*workers)
             if self.stop:
@@ -111,17 +117,29 @@ class Crawler:
                 self.store.lock(self.s.block_lock_hours, reason)
             self.status.state, self.status.reason = state, reason
             self.status.doing = "finished"
-            # F11: checkpoint whatever is left so a run can resume (not after done)
-            self.store.set_kv("checkpoint", self.frontier.to_json() if len(self.frontier) else "")
-            self.store.end_run(self.run_id, state, reason, pages=self.status.pages_done,
-                               requests=self.status.requests, bytes=self.status.bytes_total,
-                               new_qualifying=self.status.new_qualifying,
-                               extra={"hit_rate_by_type": self.status.to_dict()["hit_rate_by_type"],
-                                      "pages_by_type": self.status.pages_by_type,
-                                      "hits_by_type": self.status.hits_by_type,
-                                      "bytes_by_type": self.status.bytes_by_type})
             ticker.cancel()
-            self.status.write(self.s.status_path)
+            # each step on its own, so one failure (or a second Ctrl+C) cannot skip the others
+            try:
+                self.store.end_run(self.run_id, state, reason, pages=self.status.pages_done,
+                                   requests=self.status.requests, bytes=self.status.bytes_total,
+                                   new_qualifying=self.status.new_qualifying,
+                                   extra={"hit_rate_by_type": self.status.to_dict()["hit_rate_by_type"],
+                                          "pages_by_type": self.status.pages_by_type,
+                                          "hits_by_type": self.status.hits_by_type,
+                                          "bytes_by_type": self.status.bytes_by_type})
+            except Exception as exc:  # noqa: BLE001
+                log.error("end_run_failed", error=str(exc))
+            # F11: save what is left to fetch. A run that never got past robots.txt/seeding must NOT
+            # overwrite the queue saved by earlier runs.
+            if self.seeded:
+                try:
+                    self.store.set_kv("checkpoint", self.frontier.to_json() if len(self.frontier) else "")
+                except Exception as exc:  # noqa: BLE001
+                    log.error("checkpoint_failed", error=str(exc))
+            try:
+                self.status.write(self.s.status_path)
+            except OSError:
+                pass
             log.info("run_end", run_id=self.run_id, state=state, reason=reason, pages=self.status.pages_done,
                      requests=self.status.requests, new_qualifying=self.status.new_qualifying)
         return RunSummary(self.run_id, state, reason, self.status.pages_done, self.status.requests,
@@ -168,6 +186,13 @@ class Crawler:
         if use_sitemaps:
             for sm in self.robots.sitemaps:  # C7
                 self._enqueue(sm, depth=0, priority=300, parent_section=None, reason="sitemap")
+            if not len(self.frontier):
+                # Nothing queued and the sitemaps were read recently: read them again so the run
+                # discovers pages it has never fetched, instead of sitting idle.
+                self.rediscover = True
+                for sm in self.robots.sitemaps:
+                    self._enqueue(sm, depth=0, priority=300, parent_section=None, reason="rediscover")
+                log.info("rediscover", queued=len(self.frontier))
         if not len(self.frontier):
             raise StopRun("done", "nothing to crawl (all seeds disallowed or recently checked)")
 
@@ -227,7 +252,7 @@ class Crawler:
         if is_asset(url):  # 2.2: no images or other assets, ever
             self.frontier.mark_visited(url, "asset")
             return False
-        if not self._due(url):
+        if not self._due(url) and not (self.rediscover and page_type(url) == "sitemap"):
             # 6.1: queued but not yet due -> skipped with no request and no budget, so the queue and
             # the predictions only count pages that will actually be fetched
             self.status.skipped_recent += 1
@@ -289,7 +314,7 @@ class Crawler:
                 self.frontier.mark_visited(e.url, "disallowed")
                 log.info("robots_skip", url=e.url, robots="disallow", stage="fetch")
                 continue
-            if not self._due(e.url):  # memory across runs: no request, no budget
+            if not self._due(e.url) and not (self.rediscover and e.kind == "sitemap"):  # memory across runs
                 self.status.skipped_recent += 1
                 self.frontier.mark_visited(e.url, "skipped_recent")
                 continue
@@ -517,6 +542,7 @@ class Crawler:
                 continue
             seen.add(c.sku)
             v = c.verdict
+            qualifies = v.approved and self._price_ok(c.price, c.old_price)
             on_product_page = page.kind == "product" and c in page.products
             q = dict(
                 title=c.title, price=c.price, old_price=c.old_price, currency="NGN", source_page=e.url,
@@ -526,10 +552,10 @@ class Crawler:
                 card_seen_at=None if on_product_page else (now if c.has_old_price else None),
                 product_page_checked_at=now if on_product_page else None,
             )
-            status = self.store.upsert_product(sku=c.sku, qualifies=v.approved, discount_pct=v.discount_pct,
+            status = self.store.upsert_product(sku=c.sku, qualifies=qualifies, discount_pct=v.discount_pct,
                                                url=c.url or (e.url if on_product_page else None),
                                                run_id=self.run_id or 0, **q)
-            if v.approved:
+            if qualifies:
                 if self.status.best_discount is None or (v.discount_pct or 0) > self.status.best_discount:
                     self.status.best_discount = v.discount_pct
                 if status == "new":
@@ -537,6 +563,9 @@ class Crawler:
                     self.status.new_qualifying += 1
                     log.info("new_qualifying", sku=c.sku, discount=v.discount_pct, url=c.url, flags=v.flags)
         return new_hits
+
+    def _price_ok(self, price: float | None, old_price: float | None) -> bool:
+        return in_price_range(price, old_price, self.s.max_price_ngn, self.s.max_old_price_ngn)
 
     def _update_prune(self, e: Entry, page: PageResult) -> None:
         """F8: stop a section after prune_window consecutive pages with no card at 50%+."""
@@ -591,7 +620,7 @@ class Crawler:
                         now - row["card_seen_at"] < self.s.recheck_product_below_hours * h:
                     continue
                 reason = "no_old_price"
-            elif c.verdict.approved:
+            elif c.verdict.approved and self._price_ok(c.price, c.old_price):
                 if row is not None and row["product_page_checked_at"] and \
                         now - row["product_page_checked_at"] < self.s.recheck_product_qualifying_hours * h:
                     continue

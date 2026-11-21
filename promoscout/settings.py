@@ -56,6 +56,17 @@ class Settings(BaseSettings):
     target_candidates: int = 30
     # Sitemaps count against max_links_per_run; this caps how many child sitemaps one run reads.
     max_sitemaps_per_run: int = 5
+    # Price filter (operator rule): a product is sourced only if price < max_price_ngn
+    # OR old price < max_old_price_ngn. Applied on top of the 80% discount rule.
+    max_price_ngn: float = 20_000
+    max_old_price_ngn: float = 1_000_000
+    # auto mode: rest after each batch = batch duration x auto_rest_factor, kept between the
+    # min and max below; the max is used after any server pushback or network trouble.
+    auto_rest_factor: float = 1.0
+    auto_min_cooldown_minutes: float = 15
+    auto_max_cooldown_minutes: float = 60
+    auto_max_runs_per_day: int = 24
+    auto_max_batches: int = 0  # 0 = keep going until stopped
 
     data_dir: Path = Path("data")
 

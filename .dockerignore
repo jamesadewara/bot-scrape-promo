@@ -1,0 +1,13 @@
+.git
+.venv
+venv
+data
+tests
+__pycache__
+**/__pycache__
+.pytest_cache
+*.pyc
+.env
+approved.csv
+RUNBOOK.md
+run_auto.ps1

@@ -75,7 +75,7 @@ with st.expander("Run status", expanded=running):
 
 # ------------------------------------------------------------------ queue
 latest_run = store.db.execute("SELECT MAX(id) FROM runs").fetchone()[0]
-rows = store.qualifying()
+rows = store.qualifying(settings.max_price_ngn, settings.max_old_price_ngn)
 for r in rows:
     r["is_new"] = latest_run is not None and r.get("first_seen_run") == latest_run
 
@@ -90,7 +90,8 @@ status_map = {"To review": ("pending",), "Unsure": ("unsure",), "Approved": ("ap
 view = [r for r in rows if (r["review_status"] or "pending") in status_map[show]
         and all(f in r["flags"] for f in flag_filter) and (r["is_new"] or not only_new)]
 view.sort(key=review_sort_key)  # 5.2: discount desc, then New, campaign hint, most recently seen
-st.write(f"{len(view)} products · ranked by discount, highest first · open the live link to verify")
+st.write(f"{len(view)} products · ranked by discount, highest first · open the live link to verify · "
+         f"price filter: price < ₦{settings.max_price_ngn:,.0f} or old price < ₦{settings.max_old_price_ngn:,.0f}")
 
 LABEL = {"pending": "", "approved": "Approve", "rejected": "Reject", "unsure": "Unsure"}
 REV = {"Approve": "approved", "Reject": "rejected", "Unsure": "unsure"}

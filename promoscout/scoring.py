@@ -84,3 +84,8 @@ def review_sort_key(p: dict) -> tuple:
         0 if p.get("campaign_hint") else 1,
         -(p.get("last_seen_ts") or 0),
     )
+
+
+def in_price_range(price: float | None, old_price: float | None, max_price: float, max_old_price: float) -> bool:
+    """Operator price filter: price < max_price OR old price < max_old_price (strictly less)."""
+    return (price is not None and price < max_price) or (old_price is not None and old_price < max_old_price)

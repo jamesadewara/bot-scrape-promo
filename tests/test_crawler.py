@@ -379,3 +379,16 @@ def test_check_command(env, fixture_text, capsys):
     rc = cmd_check(None, c.s)
     out = capsys.readouterr().out
     assert "requests to disallowed URLs: 0" in out and "OVERALL: OK" in out and rc == 0
+
+
+async def test_price_filter_applied(env, fixture_text):
+    # DEEP: price 5,000 -> in; make a 90% card with price 200,000 and old 2,000,000 -> out
+    listing = fixture_text("listing_edge_cases.html").replace(
+        '<div class="prc">₦ 9,000</div><div class="s-prc-w"><div class="old">₦ 10,000</div>',
+        '<div class="prc">₦ 200,000</div><div class="s-prc-w"><div class="old">₦ 2,000,000</div>')
+    c, f, store, _ = env({B + "/tablets/": (200, listing, {})}, default=(500, "", {}))
+    await c.run(seed=B + "/tablets/", use_sitemaps=False)
+    assert store.get_product("SMALL00001")["qualifies"] == 0            # 90% but outside the price filter
+    assert B + "/small-deal-400000101.html" not in f.calls              # no verify request spent on it
+    assert store.get_product("DEEP000001")["qualifies"] == 1
+    assert {r["sku"] for r in store.qualifying(20_000, 1_000_000)} >= {"DEEP000001"}
