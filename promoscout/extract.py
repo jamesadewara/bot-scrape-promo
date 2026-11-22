@@ -19,7 +19,7 @@ STORE_MARKER = "window.__STORE__"
 CAMPAIGN_TEXT_RE = re.compile(
     r"black[\s-]?friday|flash[\s-]?sale|deal|clearance|% ?off|mega[\s-]?sale|promo|blf\d*"
     r"|treasure[\s-]?hunt|snatch|anniversary|11[.:\s-]?11|12[.:\s-]?12|price[\s-]?drop|crazy|giveaway"
-    r"|9\d ?%", re.I
+    r"|9\d ?%|mystery|surprise[\s-]?box|blind[\s-]?box|lucky[\s-]?box", re.I
 )
 CAMPAIGN_IMG_RE = re.compile(r"(BLF\d+|black-friday/\d{4})", re.I)
 DELIVERY_RE = re.compile(r"within the next \d+\s*hrs?", re.I)

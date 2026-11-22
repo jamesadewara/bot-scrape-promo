@@ -17,6 +17,7 @@ PRODUCT_RE = re.compile(r"-(?:mpg)?\d+\.html$")
 # campaign pages (5.3 promo patterns): /mlp-*/, /flash-sales/ and per-category /<category>/flash-sales/
 CAMPAIGN_RE = re.compile(r"^/(?:mlp-[^/]+|flash-sales|[a-z0-9][a-z0-9-]*/flash-sales)/$")
 SEG = r"[a-z0-9][a-z0-9\-]*"
+SLP_RE = re.compile(r"^/slp/(?!nc/)[a-z0-9][a-z0-9\-]*/?$")
 # listing pages: /tablets/ and brand-in-category /tablets/apple/ (robots.txt still decides per URL)
 LISTING_RE = re.compile(rf"^/{SEG}/(?:{SEG}/)?$")
 NOT_LISTING_FIRST = ("sp-", "blog", "customer", "cart", "catalog", "checkout", "wishlist", "en", "ur",
@@ -61,6 +62,8 @@ def page_type(url: str) -> str:
         return "product"
     if CAMPAIGN_RE.match(path):
         return "campaign"
+    if SLP_RE.match(path):
+        return "listing"  # keyword landing pages, e.g. /slp/hello-kitty-mystery-box
     # category paths like /tablets/ and /tablets/apple/ (paging via ?page=N stays a listing)
     if LISTING_RE.match(path):
         first = path.strip("/").split("/")[0]
@@ -110,3 +113,11 @@ def page_family(url: str) -> str:
     /mlp-samsung-galaxy-s4/ and /mlp-samsung-j2-core/ -> "mlp-samsung"; /tablets/apple/ -> "tablets"."""
     first = urlsplit(url).path.strip("/").split("/")[0]
     return "-".join(first.split("-")[:2]) if first else "/"
+
+
+def hunt_match(text: str | None, keywords: list[str]) -> bool:
+    """True if the text (URL path or title) contains a hunt keyword, ignoring case and -/_ vs space."""
+    if not text:
+        return False
+    t = text.lower().replace("_", " ").replace("-", " ")
+    return any(k.lower().replace("-", " ") in t for k in keywords)

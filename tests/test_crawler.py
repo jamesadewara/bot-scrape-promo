@@ -585,3 +585,37 @@ async def test_category_saved_and_filter_variants_never_fetched(env, fixture_tex
     top = store.get_product("TI527MP5Y6603NAFAMZ")
     assert top["qualifies"] == 1 and top["category"] == "Phones & Tablets > Tablets > Other Tablets" or \
         top["category"].startswith("Phones & Tablets > Tablets")
+
+
+async def test_mystery_box_kept_from_50_percent_and_alerted(env, fixture_text):
+    cards = (
+        '<article class="prd _fb col c-prd"><a href="/gadget-mystery-box-random-electronics-400000901.html" '
+        'class="core" data-gtm-id="MYST000001" data-gtm-dimension44="0"><div class="name">Gadget Mystery Box - '
+        'Random Electronics</div><div class="prc">₦ 4,000</div><div class="s-prc-w"><div class="old">₦ 10,000</div>'
+        '<div class="bdg _dsct">-60%</div></div></a></article>'
+        '<article class="prd _fb col c-prd"><a href="/plain-mug-400000902.html" class="core" '
+        'data-gtm-id="MUG0000001" data-gtm-dimension44="0"><div class="name">Plain mug</div>'
+        '<div class="prc">₦ 4,000</div><div class="s-prc-w"><div class="old">₦ 10,000</div>'
+        '<div class="bdg _dsct">-60%</div></div></a></article>')
+    listing = fixture_text("listing_edge_cases.html").replace('<section class="card"><div class="row">',
+                                                              '<section class="card"><div class="row">' + cards)
+    c, f, store, _ = env({B + "/tablets/": (200, listing, {})}, default=(500, "", {}))
+    await c.run(seed=B + "/tablets/", use_sitemaps=False)
+    box = store.get_product("MYST000001")
+    assert box["qualifies"] == 1 and "mystery_box" in json.loads(box["flags"])     # 60% mystery box kept
+    assert store.get_product("MUG0000001")["qualifies"] == 0                        # 60% mug is not
+    assert "MYST000001" in {h["sku"] for h in c.status.hot_finds}                   # always alerted
+    assert B + "/gadget-mystery-box-random-electronics-400000901.html" in f.calls   # verified on its page
+
+
+async def test_mystery_links_fetched_first_and_never_capped(env, fixture_text):
+    links = ('<a href="/slp/hello-kitty-mystery-box">Hello Kitty Mystery Box</a>'
+             '<a href="/mlp-random-deals/">Mystery box deals</a>'
+             + "".join(f'<a href="/mlp-promo-{i}/">p{i}</a>' for i in range(12)))
+    listing = fixture_text("listing_tablets.html").replace("</main>", links + "</main>")
+    c, f, store, _ = env({B + "/tablets/": (200, listing, {})}, max_links_per_run=1)
+    await c.run(seed=B + "/tablets/", use_sitemaps=False)
+    pr = {e["url"]: e["priority"] for e in json.loads(store.get_kv("checkpoint"))["entries"]}
+    top = sorted(pr, key=lambda u: -pr[u])[:2]
+    assert set(top) == {B + "/slp/hello-kitty-mystery-box", B + "/mlp-random-deals/"}   # URL and link-text hits
+    assert c._family_open(B + "/slp/hello-kitty-mystery-box")

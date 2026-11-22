@@ -146,6 +146,12 @@ rows = store.qualifying(settings.max_price_ngn, settings.max_old_price_ngn)
 for r in rows:
     r["is_new"] = latest_run is not None and r.get("first_seen_run") == latest_run
 
+s1, s2 = st.columns([3, 1])
+search = s1.text_input("Search", placeholder="e.g. earbuds oraimo, charger type-c, iphone case, SKU ...",
+                       help="Every word must appear in the title, category, campaign or SKU (any order, any case)")
+bf_choice = s2.selectbox("Black Friday", ["All products", "Black Friday only", "Not Black Friday"],
+                         help="Black Friday = Jumia's 'Black Friday deal' badge or BLF / JBF campaign tags")
+
 f1, f2, f3 = st.columns([1, 2, 1])
 show = f1.selectbox("Show", ["To review", "Unsure", "Approved", "Rejected", "Hidden", "All"])
 all_flags = sorted({f for r in rows for f in r["flags"]})
@@ -167,9 +173,28 @@ def is_gadget(r) -> bool:
     return any(level.strip().lower() in GADGET_CATS for level in cat.split(" > "))
 
 
+def is_black_friday(r) -> bool:
+    """Jumia's own campaign marks: the 'Black Friday deal' badge or BLF / BLF_* / JBF tags."""
+    hint = (r.get("campaign_hint") or "").lower()
+    if "black friday" in hint:
+        return True
+    tags = {t.strip() for part in hint.split(";") for t in part.split("|")}
+    return any(t == "blf" or t.startswith("blf_") or t == "jbf" for t in tags)
+
+
+def matches_search(r, query: str) -> bool:
+    words = query.lower().split()
+    if not words:
+        return True
+    haystack = " ".join(str(r.get(k) or "") for k in ("title", "category", "campaign_hint", "sku")).lower()
+    return all(w in haystack for w in words)
+
+
 g1, g2 = st.columns([1, 3])
 gadgets_only = g1.toggle("Gadgets only", value=False,
                          help="Phones & Tablets, Electronics, Computing, Gaming and their sub-categories")
+mystery_only = g1.toggle("Mystery boxes only", value=False,
+                         help=f"Mystery / surprise / blind boxes (kept from {settings.hunt_min_discount:g}% off)")
 all_cats = sorted({top_category(r) for r in rows})
 cat_filter = g2.multiselect("Categories", all_cats)
 
@@ -182,9 +207,14 @@ st.caption(f"Auto-hidden: {n_hidden} (under {settings.review_keep_min_discount:g
            "they return if their price changes)" + (f" · {auto_hidden} hidden just now" if auto_hidden else ""))
 view = [r for r in rows if (r["review_status"] or "pending") in status_map[show]
         and all(f in r["flags"] for f in flag_filter) and (r["is_new"] or not only_new)
-        and (is_gadget(r) or not gadgets_only) and (top_category(r) in cat_filter or not cat_filter)]
+        and (is_gadget(r) or not gadgets_only) and (top_category(r) in cat_filter or not cat_filter)
+        and matches_search(r, search)
+        and ("mystery_box" in r["flags"] or not mystery_only)
+        and (bf_choice == "All products" or is_black_friday(r) == (bf_choice == "Black Friday only"))]
 view.sort(key=review_sort_key)  # 5.2: discount desc, then New, campaign hint, most recently seen
-st.write(f"{len(view)} products · ranked by discount, highest first · open the live link to verify · "
+n_bf = sum(1 for r in view if is_black_friday(r))
+st.write(f"{len(view)} products ({n_bf} Black Friday) · ranked by discount, highest first · "
+         "open the live link to verify · "
          f"price filter: price < ₦{settings.max_price_ngn:,.0f} or old price < ₦{settings.max_old_price_ngn:,.0f}")
 
 LABEL = {"pending": "", "approved": "Approve", "rejected": "Reject", "unsure": "Unsure", "hidden": ""}
@@ -193,6 +223,7 @@ df = pd.DataFrame([{
     "Rank": i + 1,
     "Discount %": r["discount_pct"],
     "New": bool(r["is_new"]),
+    "Black Friday": is_black_friday(r),
     "Title": r["title"] or r["sku"],
     "Category": r.get("category") or "(seen before categories were saved)",
     "Live link": r["url"],

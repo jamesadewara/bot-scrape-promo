@@ -23,7 +23,7 @@ from .status import RunStatus
 from .store import Store
 from urllib.parse import urlsplit
 
-from .urls import has_filter_params, is_asset, normalize, page_family, page_number, page_type
+from .urls import has_filter_params, hunt_match, is_asset, normalize, page_family, page_number, page_type
 
 log = structlog.get_logger("promoscout")
 
@@ -270,6 +270,8 @@ class Crawler:
                      worst=sorted(self.family_bonus.items(), key=lambda x: x[1])[:5])
 
     def _family_open(self, url: str) -> bool:
+        if hunt_match(urlsplit(url).path, self.s.hunt_keywords):
+            return True  # hunt pages are never capped
         fam = page_family(url)
         if self.family_best.get(fam, 0.0) >= 79.5 or self.hot_sections.get(fam, 0.0) >= 79.5:
             return True  # a family that produced 80%+ finds stays open
@@ -277,6 +279,8 @@ class Crawler:
 
     def _focus(self, url: str) -> float:
         """Gadget/phone focus plus what past batches learned about this family of pages."""
+        if hunt_match(urlsplit(url).path, self.s.hunt_keywords):
+            return self.s.hunt_bonus  # mystery / surprise boxes first, whatever the family's history
         fam = page_family(url)
         learned = self.family_bonus.get(fam, 0.0)
         if fam in self.family_suppressed:
@@ -619,7 +623,11 @@ class Crawler:
                 continue
             seen.add(c.sku)
             v = c.verdict
-            qualifies = v.approved and self._price_ok(c.price, c.old_price)
+            is_hunt = hunt_match(c.title, self.s.hunt_keywords)
+            if is_hunt and "mystery_box" not in v.flags:
+                v.flags.append("mystery_box")
+            hunt_ok = is_hunt and v.discount_pct is not None and v.discount_pct >= self.s.hunt_min_discount
+            qualifies = (v.approved or hunt_ok) and self._price_ok(c.price, c.old_price)
             if (qualifies and "old_price_inflated" not in v.flags
                     and inflated_old_price(c, candidates, self.s.inflation_factor)):
                 v.flags.append("old_price_inflated")
@@ -642,7 +650,7 @@ class Crawler:
                     new_hits += 1
                     self.status.new_qualifying += 1
                     log.info("new_qualifying", sku=c.sku, discount=v.discount_pct, url=c.url, flags=v.flags)
-                if (v.discount_pct or 0) >= self.s.alert_min_discount and self.store.mark_alerted(c.sku):
+                if ((v.discount_pct or 0) >= self.s.alert_min_discount or is_hunt) and self.store.mark_alerted(c.sku):
                     self._hot_find(c, v, e.url)
         return new_hits
 
@@ -731,7 +739,9 @@ class Crawler:
                 if row is not None and row["card_seen_at"] and                         now - row["card_seen_at"] < self.s.recheck_product_below_hours * h:
                     continue  # a card with old price data was read within the revisit window
                 reason = "no_old_price"
-            elif c.verdict.approved and self._price_ok(c.price, c.old_price):
+            elif (c.verdict.approved or (hunt_match(c.title, self.s.hunt_keywords)
+                                         and (c.verdict.discount_pct or 0) >= self.s.hunt_min_discount)) \
+                    and self._price_ok(c.price, c.old_price):
                 if (row is not None and row["review_status"] in ("hidden", "rejected")
                         and row["price"] == c.price and row["old_price"] == c.old_price):
                     continue  # memo: hidden/rejected and unchanged -> no request spent on it
@@ -765,8 +775,10 @@ class Crawler:
                 # rejected links must not take a slot; _enqueue records why (robots / recently checked)
                 self._enqueue(link.url, depth=e.depth + 1, priority=0, parent_section=e.section)
                 continue
+            hunt = self.s.hunt_bonus if (hunt_match(link.anchor, self.s.hunt_keywords)
+                                         and not hunt_match(urlsplit(link.url).path, self.s.hunt_keywords)) else 0
             nav[k].append((link_priority(link.url, parent_best, link.campaign_hint, page_hint)
-                           + self._focus(link.url), link.url))
+                           + self._focus(link.url) + hunt, link.url))
         for lst in nav.values():
             lst.sort(key=lambda o: -o[0])
         left = budget - pushed

@@ -61,6 +61,7 @@ class Settings(BaseSettings):
     promo_seed_paths: list[str] = [
         "/phones-tablets/flash-sales/", "/electronics/flash-sales/", "/computing/flash-sales/",
         "/phones-tablets/", "/smartphones/", "/electronics/", "/computing/",
+        "/slp/mystery-box", "/slp/mystery-boxes", "/slp/surprise-box", "/slp/blind-box", "/mlp-mystery-box/",
         "/flash-sales/", "/mlp-black-friday/", "/mlp-clearance/", "/mlp-clearance-sale/",
         "/mlp-anniversary/", "/mlp-treasure-hunt/", "/mlp-jumia-black-friday-snatch-it-challenge/",
         "/mlp-11-11/", "/mlp-12-12/",
@@ -99,6 +100,16 @@ class Settings(BaseSettings):
     learn_min_pages_for_penalty: int = 6
     learn_poor_yield: float = 0.1
     learn_window_days: float = 1  # only the last N days count, so an event page is judged on recent results
+    # Hunt: mystery / surprise boxes. URLs or link text with these words get +hunt_bonus (fetched first,
+    # never capped or pushed down by learning); products whose title matches are kept from
+    # hunt_min_discount (not only 80%), flagged mystery_box and always alerted.
+    hunt_keywords: list[str] = [
+        "mystery box", "mystery-box", "mysterybox", "mystery boxes", "mystery-boxes", "surprise box",
+        "surprise-box", "blind box", "blind-box", "lucky box", "lucky-box", "mystery bag", "mystery-bag",
+        "mystery pack", "mystery-pack",
+    ]
+    hunt_bonus: float = 150
+    hunt_min_discount: float = 50
     # Look-alike pages (same family, e.g. /mlp-samsung-*/): at most this many per batch unless the family
     # already gave an 80%+ find. Stops dozens of near-identical landing pages from eating the batch.
     family_cap_per_run: int = 6

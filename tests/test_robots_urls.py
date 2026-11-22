@@ -85,3 +85,20 @@ def test_page_types_from_real_jumia_links(robots):
     assert not robots.allowed(B + "/tablets/generic/")              # */generic/ stays disallowed
     assert not robots.allowed(B + "/mlp-black-friday/xiaomi/")       # /mlp-*/*/ stays disallowed
     assert not robots.allowed(B + "/flash-sales/fashion-brand/")
+
+
+def test_slp_keyword_pages_are_allowed_listings(robots):
+    for path in ("/slp/hello-kitty-mystery-box", "/slp/mystery-box", "/slp/surprise-box/"):
+        assert page_type(B + path) == "listing", path
+        assert robots.allowed(B + path), path
+    assert page_type(B + "/slp/nc/sitemap/sitemap.xml") == "sitemap"
+
+
+def test_hunt_match():
+    from promoscout.settings import Settings
+    from promoscout.urls import hunt_match
+    kw = Settings().hunt_keywords
+    assert hunt_match("/slp/hello-kitty-mystery-box", kw)
+    assert hunt_match("Electronics MYSTERY Box - Random Gadgets", kw)
+    assert hunt_match("Lucky_Box surprise", kw)
+    assert not hunt_match("Oraimo power bank", kw) and not hunt_match(None, kw)

@@ -183,6 +183,8 @@ sudo docker compose up -d
 sudo docker build -t promoscout:latest .
 sudo docker compose up -d bot
 sudo docker compose up -d review
+```
+```bash
 sudo docker compose stop review
 ```
 
